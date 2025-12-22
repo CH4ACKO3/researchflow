@@ -1,0 +1,547 @@
+import os
+import json
+import uuid
+import shutil
+import time
+import fcntl
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union, Tuple
+import logging
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+class MetadataStorage:
+    """
+    JSON-based indexed file storage system with directory-level locking
+    
+    Features:
+    1. Create UUID-named files when storing files and record metadata in index
+    2. Query matching files based on metadata
+    3. Support partial metadata matching queries
+    4. Directory-level locking to prevent concurrent access
+    """
+    
+    def __init__(self, storage_dir: str = "storage"):
+        """
+        Initialize storage system
+        
+        Args:
+            storage_dir: File storage directory
+            index_file: Index file name
+        """
+        self.storage_dir: Path = Path(storage_dir)
+        self.index_file: Path = self.storage_dir / "index.json"
+        self.lock_file: Path = self.storage_dir / ".lock"
+        self.index_data: Dict[str, Any] = {}
+        self._lock_count: int = 0  # Lock reference count
+
+        # Create storage directory
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _acquire_lock(self):
+        """Acquire directory lock by creating a lock file (supports nested locking)"""
+        # If lock is already held by this process, just increment count
+        if self._lock_count > 0:
+            self._lock_count += 1
+            logger.debug(f"Lock count incremented to {self._lock_count}")
+            return
+        
+        # First time acquiring lock: actually acquire system lock
+        max_retries = 10
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                # Create lock file with exclusive access
+                # Don't use 'with' statement as we need to keep the file handle open
+                f = open(self.lock_file, 'w')
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Keep file handle open to maintain lock
+                self._lock_handle = f
+                self._lock_count = 1
+                logger.debug("Directory lock acquired")
+                self._load_index()
+                return
+            except BlockingIOError:
+                # Lock is held by another process
+                if attempt < max_retries - 1:
+                    logger.debug(f"Directory is locked, retrying in {retry_delay}s (attempt {attempt + 1})")
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 2.0)
+                else:
+                    logger.error(f"Failed to acquire directory lock after {max_retries} attempts")
+                    raise RuntimeError("Failed to acquire directory lock")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to acquire lock (attempt {attempt + 1}): {e}")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error(f"Failed to acquire lock after {max_retries} attempts: {e}")
+                    raise
+    
+    def _release_lock(self):
+        """Release directory lock (supports nested locking)"""
+        # If lock count > 1, just decrement count
+        if self._lock_count > 1:
+            self._lock_count -= 1
+            logger.debug(f"Lock count decremented to {self._lock_count}")
+            return
+        
+        # Last release: actually release system lock
+        if self._lock_count == 0:
+            logger.warning("Attempted to release lock that was not acquired")
+            return
+        
+        try:
+            if hasattr(self, '_lock_handle') and self._lock_handle:
+                # Clean up orphaned files before releasing lock (only on final release)
+                self.cleanup_orphaned_files()
+                
+                # First release the lock, then close the file
+                fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+                self._lock_handle.close()
+                self._lock_handle = None
+                self._lock_count = 0
+                logger.debug("Directory lock released")
+        except Exception as e:
+            logger.error(f"Failed to release lock: {e}")
+            # Try to clean up the handle even if lock release failed
+            try:
+                if hasattr(self, '_lock_handle') and self._lock_handle:
+                    self._lock_handle.close()
+                    self._lock_handle = None
+                self._lock_count = 0
+            except:
+                pass
+    
+    def _load_index(self):
+        """Load index file (assumes lock is already held)"""
+        if self.index_file.exists():
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    self.index_data = json.load(f)
+                    logger.debug(f"Index file loaded, containing {len(self.index_data)} records")
+            except Exception as e:
+                logger.error(f"Failed to load index file: {e}")
+                self.index_data = {}
+        else:
+            logger.debug("Index file does not exist, creating new index")
+            self.index_data = {}
+    
+    def _save_index(self):
+        """Save index file (assumes lock is already held)"""
+        try:
+            with open(self.index_file, 'w', encoding='utf-8') as f:
+                json.dump(self.index_data, f, ensure_ascii=False, indent=2)
+                logger.debug("Index file saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to save index file: {e}")
+            raise
+    
+    def cleanup_orphaned_files(self, clean_entries: bool = False):
+        """        
+        Args:
+            clean_entries: If True, also remove index entries that have no attachments
+        """
+        try:
+            self._acquire_lock()
+            # Collect all files that should be retained based on attachments
+            retained_files = set()
+            orphaned_index_entries = set()
+
+            def collect_retained_paths(attachments: Dict[str, Any]):
+                """Recursively collect all file and directory paths that should be retained"""
+                for key, value in attachments.items():
+                    if isinstance(value, dict):
+                        # Nested dictionary, recurse
+                        collect_retained_paths(value)
+                    elif isinstance(value, str):
+                        # This is a path (file or directory)
+                        path = Path(value)
+                        if path.is_absolute():
+                            # If it's an absolute path, check if it's within storage_dir
+                            try:
+                                path = path.relative_to(self.storage_dir)
+                            except ValueError:
+                                # Path is outside storage_dir, skip
+                                continue
+
+                        if (self.storage_dir / path).is_dir():
+                            # Directory path: retain all files in this directory and subdirectories
+                            try:
+                                for file_path in (self.storage_dir / path).rglob('*'):
+                                    if file_path.is_file():
+                                        retained_files.add(file_path.name)
+                            except Exception as e:
+                                logger.warning(f"Failed to collect files from directory {path}: {e}")
+                        else:
+                            # File path: retain this specific file
+                            retained_files.add(path.name)
+                    # Skip other types (lists, etc.) for now
+
+            def has_valid_paths(attachments: Dict[str, Any]) -> bool:
+                """Check if attachments contain any valid file or directory paths"""
+                for key, value in attachments.items():
+                    if isinstance(value, dict):
+                        # Nested dictionary, recurse
+                        if has_valid_paths(value):
+                            return True
+                    elif isinstance(value, str):
+                        # This is a path (file or directory)
+                        path = Path(value)
+                        if path.is_absolute():
+                            # If it's an absolute path, check if it's within storage_dir
+                            try:
+                                path = path.relative_to(self.storage_dir)
+                            except ValueError:
+                                # Path is outside storage_dir, skip
+                                continue
+
+                        full_path = self.storage_dir / path
+                        if full_path.is_file():
+                            # File exists
+                            return True
+                        elif full_path.is_dir():
+                            # Directory exists and is not empty
+                            try:
+                                if any(full_path.iterdir()):
+                                    return True
+                            except Exception:
+                                pass
+                return False
+
+            # Collect retained files from all index entries' attachments
+            for uuid_val, entry_info in list(self.index_data.items()):
+                attachments = entry_info.get("attachments", {})
+                collect_retained_paths(attachments)
+                # Check if entry should be marked as orphaned
+                if not has_valid_paths(attachments):
+                    orphaned_index_entries.add(uuid_val)
+
+            # Get all files currently in storage directory (excluding index.json and .lock)
+            storage_files = set()
+            for file_path in self.storage_dir.iterdir():
+                if file_path.is_file() and file_path.name not in [self.index_file.name, self.lock_file.name]:
+                    storage_files.add(file_path.name)
+
+            # Find orphaned files (files in storage but not in retained set)
+            orphaned_files = storage_files - retained_files
+
+            # Remove orphaned files
+            for orphaned_file in orphaned_files:
+                file_path = self.storage_dir / orphaned_file
+                try:
+                    file_path.unlink()
+                    logger.debug(f"Removed orphaned file: {orphaned_file}")
+                except Exception as e:
+                    logger.error(f"Failed to remove orphaned file {orphaned_file}: {e}")
+
+            # Remove orphaned index entries
+            if clean_entries:
+                self.delete_entries(uuid_query=list(orphaned_index_entries))
+
+            # Save index if any changes were made
+            if orphaned_files or (clean_entries and orphaned_index_entries):
+                self._save_index()
+                logger.info(f"Cleanup completed: removed {len(orphaned_files)} orphaned files and {len(orphaned_index_entries)} orphaned index entries")
+            else:
+                logger.debug("No cleanup needed - all files and index entries are consistent")
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup orphaned files: {e}")
+        finally:
+            self._release_lock()
+    
+    def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Create an entry and store file with directory lock
+        
+        Args:
+            uuid: UUID of the entry; if None, a new UUID will be generated
+        
+        Optional arguments:
+            metadata: Metadata of the entry
+            extra_info: Extra information of the entry
+            attachments: Attachments of the entry
+
+        Returns:
+            str: UUID of the created entry
+        """
+        try:
+            self._acquire_lock()
+            
+            if uuid is None:
+                while not uuid or uuid in self.index_data:
+                    uuid = str(uuid4())
+            else:
+                assert uuid not in self.index_data, f"UUID {uuid} already exists"
+
+            self.index_data[uuid] = {
+                "uuid": uuid,
+                "metadata": {},
+                "extra_info": {},
+                "attachments": {},
+                "created_time": time.time()
+            }
+            
+            self._save_index()
+
+            if any([metadata, extra_info, attachments]):
+                self.update_entry(uuid, metadata, extra_info, attachments)
+            
+            logger.debug(f"Created entry: {uuid}")
+        except Exception as e:
+            self.delete_entries(uuid_query=uuid)
+            raise ValueError(f"Failed to create entry: {e}")
+        finally:
+            self._release_lock()
+
+        return uuid
+
+    def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None):
+        """
+        Update entry and record metadata with directory lock
+        
+        Args:
+            uuid: UUID of the entry to update
+            metadata: Entry metadata information
+            extra_info: Extra information to store with the entry
+            attachments: Attachments to store with the entry
+        Returns:
+            str: UUID of updated entry
+        """
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError(f"Metadata must be a dictionary: {metadata}")
+        if extra_info is not None and not isinstance(extra_info, dict):
+            raise ValueError(f"Extra information must be a dictionary: {extra_info}")
+        if attachments is not None and not isinstance(attachments, dict):
+            raise ValueError(f"Attachments must be a dictionary: {attachments}")
+            
+        try:
+            self._acquire_lock()
+            
+            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid)
+
+            if len(matched_entries) != 1:
+                raise ValueError(f"Multiple or no entries found for UUID: {uuid}")
+            matched_entry = matched_entries[0]
+
+            if metadata is not None:
+                matched_entry["metadata"].update(metadata)
+            if extra_info is not None:
+                matched_entry["extra_info"].update(extra_info)
+            if attachments is not None:
+                # Ensure directories in attachments exist
+                def ensure_directories(attachments: Dict[str, Any]):
+                    """Recursively ensure directories in attachments exist"""
+                    for key, value in attachments.items():
+                        if isinstance(value, dict):
+                            # Nested dictionary, recurse
+                            ensure_directories(value)
+                        elif isinstance(value, str):
+                            path = Path(value)
+                            if path.is_absolute():
+                                try:
+                                    path = path.relative_to(self.storage_dir)
+                                except ValueError:
+                                    continue
+                            
+                            full_path = self.storage_dir / path
+                            if not full_path.exists():
+                                try:
+                                    full_path.mkdir(parents=True, exist_ok=True)
+                                    logger.debug(f"Created directory: {full_path}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to create directory {full_path}: {e}")
+                            elif full_path.is_file():
+                                pass
+                
+                ensure_directories(attachments)
+                matched_entry["attachments"].update(attachments)
+            
+            self._save_index()
+            logger.debug(f"Updated entry: {uuid}")
+        finally:
+            self._release_lock()
+    
+    def _traverse_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Internal search method that doesn't acquire locks (assumes lock is already held)"""
+        if uuid_query is None and metadata_query is None:
+            return list(self.index_data.values()), list(self.index_data.keys())
+        
+        matched_entires: list[Dict[str, Any]] = []
+        matched_uuids: list[str] = []
+        
+        if uuid_query is not None:
+            uuid_query = uuid_query if isinstance(uuid_query, list) else [uuid_query]
+                
+            for entry_uuid, entry_data in self.index_data.items():
+                if entry_uuid in uuid_query:
+                    matched_entires.append(entry_data)
+                    matched_uuids.append(entry_uuid)
+                    break
+            
+        elif metadata_query is not None:
+            for entry_uuid, entry_data in self.index_data.items():
+                entry_metadata: Dict[Any, Any] = entry_data.get("metadata", {})
+                
+                if exact_match:
+                    if self._exact_metadata_match(entry_metadata, metadata_query):
+                        matched_entires.append(entry_data)
+                        matched_uuids.append(entry_uuid)
+                else:
+                    if self._partial_metadata_match(entry_metadata, metadata_query):
+                        matched_entires.append(entry_data)
+                        matched_uuids.append(entry_uuid)
+
+        return matched_entires, matched_uuids
+    
+    def read_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """
+        Read entries and their UUIDs based on UUID or metadata with directory lock
+        
+        Args:
+            uuid_query: UUID query conditions
+            metadata_query: Metadata query conditions
+            exact_match: Whether to require exact match, False for partial match
+            
+        Returns:
+            Tuple[List[Dict[str, Any]], List[str]]: Tuple of matching entries and their UUIDs
+        """
+        try:
+            self._acquire_lock()
+            
+            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
+
+            logger.debug(f"Found {len(matched_entries)} matching entries")
+            return matched_entries, matched_uuids
+        finally:
+            self._release_lock()
+    
+    def _exact_metadata_match(self, file_metadata: Dict[str, Any], query_metadata: Dict[str, Any]) -> bool:
+        """Check if metadata matches exactly"""
+        return file_metadata == query_metadata
+    
+    def _partial_metadata_match(self, entry_metadata: Dict[str, Any], query_metadata: Dict[str, Any]) -> bool:
+        """
+        Check if metadata matches partially
+        
+        Args:
+            file_metadata: Metadata of the file
+            query_metadata: Metadata query conditions
+            
+        Returns:
+            bool: True if metadata matches partially, False otherwise
+        """
+        def match(this: Any, query: Any) -> bool:
+            if isinstance(query, dict):
+                return isinstance(this, dict) and all(match(this.get(key, None), value) for key, value in query.items())
+            elif isinstance(query, list):
+                return isinstance(this, list) and this == query
+            elif query is None:
+                return this is None
+            elif query is Any:
+                return this is not None
+            else:
+                return this == query
+
+        return match(entry_metadata, query_metadata)
+    
+    def delete_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> int:
+        """
+        Delete files based on metadata query with directory lock
+        
+        Args:
+            uuid_query: UUID query conditions
+            metadata_query: Metadata query conditions
+            exact_match: Whether to require exact match, False for partial match
+            
+        Returns:
+            int: Number of files deleted
+        """
+        try:
+            self._acquire_lock()
+            
+            # Find matching files
+            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
+            
+            if not matched_uuids:
+                logger.debug(f"No files found matching metadata: {metadata_query}")
+                return 0
+            
+            deleted_count = 0
+
+            def recursive_delete(attachments: Dict[str, Any]):
+                for attachment in attachments.values():
+                    if isinstance(attachment, dict):
+                        recursive_delete(attachment)
+                    elif isinstance(attachment, list):
+                        for item in attachment:
+                            recursive_delete(item)
+                    else:
+                        (self.storage_dir / attachment).unlink()
+            
+            for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
+                attachments: Dict[str, Any] = matched_entry.get("attachments", {})
+                try:
+                    recursive_delete(attachments)
+                    self.index_data.pop(matched_uuid)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to delete entry {matched_uuid}: {e}")
+            
+            # Save index if any files were deleted
+            if deleted_count > 0:
+                self._save_index()
+                logger.info(f"Deleted {deleted_count} files matching metadata: {metadata_query}")
+            
+            return deleted_count
+            
+        finally:
+            self._release_lock()
+    
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """
+        Get storage statistics with directory lock
+        
+        Returns:
+            Dict: Storage statistics information
+        """
+        try:
+            self._acquire_lock()
+            
+            total_files = len(self.index_data)
+            total_size = sum(file_info.get("file_size", 0) for file_info in self.index_data.values())
+            
+            # Count metadata key usage frequency
+            metadata_keys = {}
+            for file_info in self.index_data.values():
+                for key in file_info.get("metadata", {}).keys():
+                    metadata_keys[key] = metadata_keys.get(key, 0) + 1
+            
+            return {
+                "total_files": total_files,
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "metadata_keys": metadata_keys,
+                "storage_directory": str(self.storage_dir)
+            }
+        finally:
+            self._release_lock()
+
+    def __del__(self):
+        """Destructor to ensure lock is released"""
+        try:
+            if hasattr(self, '_lock_handle') and self._lock_handle:
+                self._release_lock()
+        except:
+            pass  # Ignore errors during cleanup
+    
+
+if __name__ == "__main__":
+    storage = MetadataStorage("data")
+    print(storage.get_storage_stats())
+    storage = MetadataStorage("model")
+    print(storage.get_storage_stats())
