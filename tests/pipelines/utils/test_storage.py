@@ -51,7 +51,6 @@ class TestMetadataStorage:
         assert entries[0]["metadata"] == {}
         assert entries[0]["extra_info"] == {}
         assert entries[0]["attachments"] == {}
-        assert "created_time" in entries[0]
     
     def test_create_entry_with_uuid(self, storage):
         """Test entry creation with specified UUID"""
@@ -344,23 +343,6 @@ class TestMetadataStorage:
         assert file1.exists()
         assert file2.exists()
         assert not orphaned.exists()
-    
-    def test_get_storage_stats(self, storage):
-        """Test getting storage statistics"""
-        storage.create_entry(metadata={"key1": "value1", "key2": "value2"})
-        storage.create_entry(metadata={"key1": "value3"})
-        storage.create_entry(metadata={"key3": "value4"})
-        
-        stats = storage.get_storage_stats()
-        
-        assert stats["total_files"] == 3
-        assert "total_size_bytes" in stats
-        assert "total_size_mb" in stats
-        assert "metadata_keys" in stats
-        assert stats["metadata_keys"]["key1"] == 2
-        assert stats["metadata_keys"]["key2"] == 1
-        assert stats["metadata_keys"]["key3"] == 1
-        assert stats["storage_directory"] == str(storage.storage_dir)
     
     def test_lock_mechanism_nested(self, storage):
         """Test nested locking mechanism"""

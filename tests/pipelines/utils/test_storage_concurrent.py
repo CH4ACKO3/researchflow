@@ -130,7 +130,7 @@ class TestMetadataStorageConcurrent:
         num_entries = 20
         created_uuids = []
         for i in range(num_entries):
-            uuid = storage.create_entry(metadata={"value": 0})
+            uuid = storage.create_entry(metadata={"value": i})
             created_uuids.append(uuid)
         
         num_threads = 5
