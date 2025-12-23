@@ -382,12 +382,12 @@ class MetadataStorage:
 
         return uuid
 
-    def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_multiple: bool = False):
+    def update_entry(self, uuid_query: Optional[Union[List[str], str]] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_multiple: bool = False):
         """
         Update entry and record metadata
         
         Args:
-            uuid: UUID of the entry to update
+            uuid: UUID of the entry to update, if None, update all entries
             metadata: Entry metadata information
             extra_info: Extra information to store with the entry
             attachments: Attachments to store with the entry
@@ -395,23 +395,30 @@ class MetadataStorage:
         Returns:
             str: UUID of updated entry
         """
+        if uuid_query is None and not allow_multiple:
+            raise ValueError("Must allow_multiple when uuid_query is None")
+        
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError(f"Metadata must be a dictionary: {metadata}")
         if extra_info is not None and not isinstance(extra_info, dict):
             raise ValueError(f"Extra information must be a dictionary: {extra_info}")
         if attachments is not None and not isinstance(attachments, dict):
             raise ValueError(f"Attachments must be a dictionary: {attachments}")
-            
+        
         try:
             self._acquire_lock()
             
-            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid)
-
-            if len(matched_entries) == 0:
-                raise ValueError(f"No entries found for UUID: {uuid}")
-            if len(matched_entries) > 1 and not allow_multiple:
-                raise ValueError(f"Multiple entries found for UUID: {uuid}, but allow_multiple is False")
-            
+            if uuid_query is None:
+                matched_entries, matched_uuids = self._traverse_entries(metadata_query={})
+                if len(matched_entries) == 0:
+                    raise ValueError(f"No entries found for metadata: {metadata}")
+            else:
+                matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query)
+                if len(matched_entries) == 0:
+                    raise ValueError(f"No entries found for UUID: {uuid}")
+                if len(matched_entries) > 1 and not allow_multiple:
+                    raise ValueError(f"Multiple entries found for UUID: {uuid}, but allow_multiple is False")
+                
             for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
                 if metadata is not None:
                     matched_entry["metadata"].update(metadata)
