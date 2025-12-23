@@ -256,7 +256,12 @@ class MetadataStorage:
     
     def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None) -> str:
         """
-        Create an entry and store file with directory lock
+        Create or update an entry with directory lock
+        
+        If metadata is provided, checks for existing entries with exact metadata match:
+        - 0 matches: create new entry
+        - 1 match: overwrite existing entry (use its UUID)
+        - >1 matches: raise error
         
         Args:
             uuid: UUID of the entry; if None, a new UUID will be generated
@@ -267,11 +272,25 @@ class MetadataStorage:
             attachments: Attachments of the entry
 
         Returns:
-            str: UUID of the created entry
+            str: UUID of the created/updated entry
         """
         try:
             self._acquire_lock()
             
+            # Check for existing entry with exact metadata match
+            if metadata is not None:
+                matched_entries, matched_uuids = self._traverse_entries(metadata_query=metadata, exact_match=True)
+                
+                if len(matched_uuids) > 1:
+                    raise ValueError(f"Multiple entries found with matching metadata: {matched_uuids}")
+                elif len(matched_uuids) == 1:
+                    # Overwrite existing entry
+                    uuid = matched_uuids[0]
+                    logger.debug(f"Found existing entry with matching metadata, overwriting: {uuid}")
+                    self.update_entry(uuid, metadata, extra_info, attachments)
+                    return uuid
+            
+            # Create new entry
             if uuid is None:
                 while not uuid or uuid in self.index_data:
                     uuid = str(uuid4())
@@ -282,8 +301,7 @@ class MetadataStorage:
                 "uuid": uuid,
                 "metadata": {},
                 "extra_info": {},
-                "attachments": {},
-                "created_time": time.time()
+                "attachments": {}
             }
             
             self._save_index()
@@ -293,7 +311,8 @@ class MetadataStorage:
             
             logger.debug(f"Created entry: {uuid}")
         except Exception as e:
-            self.delete_entries(uuid_query=uuid)
+            if uuid and uuid in self.index_data:
+                self.delete_entries(uuid_query=uuid)
             raise ValueError(f"Failed to create entry: {e}")
         finally:
             self._release_lock()
@@ -502,32 +521,24 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def get_storage_stats(self) -> Dict[str, Any]:
+    def get_storage_stats(self):
         """
-        Get storage statistics with directory lock
-        
-        Returns:
-            Dict: Storage statistics information
+        Print storage statistics with directory lock
         """
         try:
             self._acquire_lock()
             
-            total_files = len(self.index_data)
-            total_size = sum(file_info.get("file_size", 0) for file_info in self.index_data.values())
+            total_entries = len(self.index_data)
             
             # Count metadata key usage frequency
             metadata_keys = {}
-            for file_info in self.index_data.values():
-                for key in file_info.get("metadata", {}).keys():
+            for entry_info in self.index_data.values():
+                for key in entry_info.get("metadata", {}).keys():
                     metadata_keys[key] = metadata_keys.get(key, 0) + 1
             
-            return {
-                "total_files": total_files,
-                "total_size_bytes": total_size,
-                "total_size_mb": round(total_size / (1024 * 1024), 2),
-                "metadata_keys": metadata_keys,
-                "storage_directory": str(self.storage_dir)
-            }
+            print(f"Storage: {self.storage_dir}")
+            print(f"  Total entries: {total_entries}")
+            print(f"  Metadata keys: {', '.join(metadata_keys.keys())}")
         finally:
             self._release_lock()
 
