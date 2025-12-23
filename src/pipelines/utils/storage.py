@@ -382,7 +382,7 @@ class MetadataStorage:
 
         return uuid
 
-    def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None):
+    def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_multiple: bool = False):
         """
         Update entry and record metadata
         
@@ -391,6 +391,7 @@ class MetadataStorage:
             metadata: Entry metadata information
             extra_info: Extra information to store with the entry
             attachments: Attachments to store with the entry
+            allow_multiple: If True, allow updating multiple entries
         Returns:
             str: UUID of updated entry
         """
@@ -406,44 +407,46 @@ class MetadataStorage:
             
             matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid)
 
-            if len(matched_entries) != 1:
-                raise ValueError(f"Multiple or no entries found for UUID: {uuid}")
-            matched_entry = matched_entries[0]
-
-            if metadata is not None:
-                matched_entry["metadata"].update(metadata)
-            if extra_info is not None:
-                matched_entry["extra_info"].update(extra_info)
-            if attachments is not None:
-                # Ensure directories in attachments exist
-                def ensure_directories(attachments: Dict[str, Any]):
-                    """Recursively ensure directories in attachments exist"""
-                    for key, value in attachments.items():
-                        logger.debug(f"Checking attachment directory: {key} -> {value}")
-                        if isinstance(value, dict):
-                            # Nested dictionary, recurse
-                            ensure_directories(value)
-                        elif isinstance(value, str):
-                            path = Path(value)
-                            if path.is_absolute():
-                                try:
-                                    path = path.relative_to(self.storage_dir)
-                                except ValueError:
-                                    continue
-                            
-                            full_path = self.storage_dir / path
-                            if not full_path.exists():
-                                try:
-                                    full_path.mkdir(parents=True, exist_ok=True)
-                                    logger.debug(f"Created directory: {full_path}")
-                                except Exception as e:
-                                    logger.warning(f"Failed to create directory {full_path}: {e}")
-                            elif full_path.is_file():
-                                pass
-                
-                logger.debug(f"Updated attachments: {attachments}")
-                ensure_directories(attachments)
-                matched_entry["attachments"].update(attachments)
+            if len(matched_entries) == 0:
+                raise ValueError(f"No entries found for UUID: {uuid}")
+            if len(matched_entries) > 1 and not allow_multiple:
+                raise ValueError(f"Multiple entries found for UUID: {uuid}, but allow_multiple is False")
+            
+            for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
+                if metadata is not None:
+                    matched_entry["metadata"].update(metadata)
+                if extra_info is not None:
+                    matched_entry["extra_info"].update(extra_info)
+                if attachments is not None:
+                    # Ensure directories in attachments exist
+                    def ensure_directories(attachments: Dict[str, Any]):
+                        """Recursively ensure directories in attachments exist"""
+                        for key, value in attachments.items():
+                            logger.debug(f"Checking attachment directory: {key} -> {value}")
+                            if isinstance(value, dict):
+                                # Nested dictionary, recurse
+                                ensure_directories(value)
+                            elif isinstance(value, str):
+                                path = Path(value)
+                                if path.is_absolute():
+                                    try:
+                                        path = path.relative_to(self.storage_dir)
+                                    except ValueError:
+                                        continue
+                                
+                                full_path = self.storage_dir / path
+                                if not full_path.exists():
+                                    try:
+                                        full_path.mkdir(parents=True, exist_ok=True)
+                                        logger.debug(f"Created directory: {full_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to create directory {full_path}: {e}")
+                                elif full_path.is_file():
+                                    pass
+                    
+                    logger.debug(f"Updated attachments: {attachments}")
+                    ensure_directories(attachments)
+                    matched_entry["attachments"].update(attachments)
             
             self._save_index()
             logger.debug(f"Updated entry: {uuid}")
