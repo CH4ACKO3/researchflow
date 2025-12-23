@@ -488,7 +488,6 @@ class MetadataStorage:
                 if entry_uuid in uuid_query:
                     matched_entires.append(entry_data)
                     matched_uuids.append(entry_uuid)
-                    break
             
         elif metadata_query is not None:
             for entry_uuid, entry_data in self.index_data.items():
