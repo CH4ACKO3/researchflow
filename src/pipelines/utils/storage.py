@@ -307,7 +307,7 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None) -> str:
+    def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_overwrite: Optional[Union[str, bool]] = "finished") -> str:
         """
         Create or update an entry
         
@@ -338,6 +338,16 @@ class MetadataStorage:
                     raise ValueError(f"Multiple entries found with matching metadata: {matched_uuids}")
                 elif len(matched_uuids) == 1:
                     # Overwrite existing entry
+                    if allow_overwrite == "finished":
+                        if not self.index_data[matched_uuids[0]].get("extra_info", {}).get("finished", False) == True:
+                            raise ValueError(f"Entry {matched_uuids[0]} is not finished, cannot overwrite")
+                    elif allow_overwrite == True:
+                        pass
+                    elif allow_overwrite == False:
+                        raise ValueError(f"Entry {matched_uuids[0]} already exists, cannot overwrite")
+                    else:
+                        raise ValueError(f"Invalid allow_overwrite value: {allow_overwrite}")
+
                     uuid = matched_uuids[0]
                     logger.debug(f"Found existing entry with matching metadata, overwriting: {uuid}")
                     self.update_entry(uuid, metadata, extra_info, attachments)
@@ -431,6 +441,7 @@ class MetadataStorage:
                             elif full_path.is_file():
                                 pass
                 
+                logger.debug(f"Updated attachments: {attachments}")
                 ensure_directories(attachments)
                 matched_entry["attachments"].update(attachments)
             
@@ -588,13 +599,15 @@ class MetadataStorage:
                         for item in attachment:
                             recursive_delete(item)
                     else:
-                        (self.storage_dir / attachment).unlink()
+                        (self.storage_dir / attachment).unlink(missing_ok=True)
             
             for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
                 attachments: Dict[str, Any] = matched_entry.get("attachments", {})
                 try:
                     recursive_delete(attachments)
-                    self.index_data.pop(matched_uuid)
+                    logger.debug(f"Deleted attachments: {attachments}")
+                    del self.index_data[matched_uuid]
+                    logger.debug(f"Deleted entry: {matched_uuid}")
                     deleted_count += 1
                 except Exception as e:
                     logger.error(f"Failed to delete entry {matched_uuid}: {e}")
