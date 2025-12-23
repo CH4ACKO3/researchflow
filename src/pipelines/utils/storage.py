@@ -152,9 +152,18 @@ class MetadataStorage:
         """Save index file atomically with backup"""
         temp_file = self.storage_dir / f".index.json.tmp.{uuid.uuid4()}"
         try:
+            # Custom encoder to handle Path objects and other non-serializable types
+            class PathEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    # Handle Path and its subclasses (PosixPath, WindowsPath, etc.)
+                    if isinstance(obj, Path):
+                        return str(obj)
+                    # Let the base class raise TypeError for other non-serializable types
+                    return super().default(obj)
+            
             # Write to temporary file first
             with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.index_data, f, ensure_ascii=False, indent=2)
+                json.dump(self.index_data, f, ensure_ascii=False, indent=2, cls=PathEncoder)
                 # Ensure data is written to disk
                 f.flush()
                 os.fsync(f.fileno())
