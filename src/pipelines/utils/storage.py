@@ -300,7 +300,7 @@ class MetadataStorage:
     
     def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None) -> str:
         """
-        Create or update an entry with directory lock
+        Create or update an entry
         
         If metadata is provided, checks for existing entries with exact metadata match:
         - 0 matches: create new entry
@@ -365,7 +365,7 @@ class MetadataStorage:
 
     def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None):
         """
-        Update entry and record metadata with directory lock
+        Update entry and record metadata
         
         Args:
             uuid: UUID of the entry to update
@@ -430,7 +430,6 @@ class MetadataStorage:
             self._release_lock()
     
     def _traverse_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """Internal search method that doesn't acquire locks """
         if uuid_query is None and metadata_query is None:
             return list(self.index_data.values()), list(self.index_data.keys())
         
@@ -463,7 +462,7 @@ class MetadataStorage:
     
     def read_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
         """
-        Read entries and their UUIDs based on UUID or metadata with directory lock
+        Read entries and their UUIDs based on UUID or metadata query
         
         Args:
             uuid_query: UUID query conditions
@@ -473,13 +472,48 @@ class MetadataStorage:
         Returns:
             Tuple[List[Dict[str, Any]], List[str]]: Tuple of matching entries and their UUIDs
         """
+
+        if not (uuid_query is None or metadata_query is None):
+            raise ValueError("Only one of uuid_query or metadata_query can be provided")
+        elif uuid_query is None and metadata_query is None:
+            raise ValueError("One of uuid_query or metadata_query must be provided")
+        
         try:
             self._acquire_lock()
             
             matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
 
-            logger.debug(f"Found {len(matched_entries)} matching entries")
+            logger.debug(f"Found {len(matched_entries)} matching entries for query: {uuid_query if uuid_query is not None else metadata_query}")
             return matched_entries, matched_uuids
+        finally:
+            self._release_lock()
+    
+    def get_entry(self, uuid_query: Optional[str] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Dict[str, Any]:
+        """
+        Get exactly one entry by UUID or metadata query
+        
+        Args:
+            uuid_query: UUID query conditions
+            metadata_query: Metadata query conditions
+            exact_match: Whether to require exact match, False for partial match
+            
+        Returns:
+            Dict[str, Any]: Entry data
+        """
+        if not (uuid_query is None or metadata_query is None):
+            raise ValueError("Only one of uuid_query or metadata_query can be provided")
+        elif uuid_query is None and metadata_query is None:
+            raise ValueError("One of uuid_query or metadata_query must be provided")
+
+        try:
+            self._acquire_lock()
+            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
+
+            if len(matched_entries) != 1:
+                raise ValueError(f"{len(matched_entries)} entries found for query: {uuid_query if uuid_query is not None else metadata_query}")
+            return matched_entries[0]
+        except Exception as e:
+            raise ValueError(f"Failed to get entry: {e}")
         finally:
             self._release_lock()
     
@@ -514,7 +548,7 @@ class MetadataStorage:
     
     def delete_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> int:
         """
-        Delete files based on metadata query with directory lock
+        Delete files based on metadata query
         
         Args:
             uuid_query: UUID query conditions
@@ -567,7 +601,7 @@ class MetadataStorage:
     
     def get_storage_stats(self):
         """
-        Print storage statistics with directory lock
+        Print storage statistics
         """
         try:
             self._acquire_lock()
