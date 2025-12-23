@@ -298,7 +298,7 @@ class MetadataStorage:
             # Save index if any changes were made
             if orphaned_files or (clean_entries and orphaned_index_entries):
                 self._save_index()
-                logger.info(f"Cleanup completed: removed {len(orphaned_files)} orphaned files and {len(orphaned_index_entries)} orphaned index entries")
+                logger.debug(f"Cleanup completed: removed {len(orphaned_files)} orphaned files and {len(orphaned_index_entries)} orphaned index entries")
             else:
                 logger.debug("No cleanup needed - all files and index entries are consistent")
 
@@ -409,6 +409,7 @@ class MetadataStorage:
                 def ensure_directories(attachments: Dict[str, Any]):
                     """Recursively ensure directories in attachments exist"""
                     for key, value in attachments.items():
+                        logger.debug(f"Checking attachment directory: {key} -> {value}")
                         if isinstance(value, dict):
                             # Nested dictionary, recurse
                             ensure_directories(value)

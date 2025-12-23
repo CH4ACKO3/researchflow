@@ -227,7 +227,7 @@ class TaskIO:
             self.file_last_mtime[file_path] = file_path.stat().st_mtime
 
 class ProcessorWorker:
-    def __init__(self, gpu_id, max_memory=40, max_util=80, grace_period=120):
+    def __init__(self, gpu_id, max_memory=40, max_util=80, grace_period=120, debug=False):
         self.gpu_id = gpu_id
         self.status_lock = asyncio.Lock()
         self.status = "starting"
@@ -241,6 +241,7 @@ class ProcessorWorker:
         self.memory.append(0)
         self.util.append(0)
         self.running_proc = dict() 
+        self.debug = debug
 
     async def start(self, task_queue, message_queue, task_pool, task_pool_lock):
         self.task_queue = task_queue
@@ -305,7 +306,7 @@ class ProcessorWorker:
                                     task = self.task_queue.get_nowait()
                                     async with self.task_pool_lock:
                                         if task in self.task_pool["waiting"]:
-                                            proc = subprocess.Popen(f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}", shell=True, stdout=LOG_FILE, stderr=LOG_FILE)
+                                            proc = subprocess.Popen(f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}{' --debug' if self.debug else ''}", shell=True, stdout=LOG_FILE, stderr=LOG_FILE)
                                             self.running_proc[task] = proc
                                             self.task_start_times[task] = time.time()
                                             self.status = "running"
@@ -398,7 +399,14 @@ async def main():
                         help='Maximum GPU utilization percentage (default: 80.0)')
     parser.add_argument('--grace-period', type=int, default=180,
                         help='Grace period in seconds before starting new task after last task (default: 180)')
+    parser.add_argument('--debug', action='store_true', default=False,
+                        help='Debug mode')
     args = parser.parse_args()
+    
+    if args.debug:
+        console_logger.setLevel(logging.DEBUG)
+        file_handler.setLevel(logging.DEBUG)
+        history_logger.setLevel(logging.DEBUG)
     
     monitor_gpu_loop = None
     task_io = None
@@ -411,7 +419,7 @@ async def main():
         monitor_gpu_loop = asyncio.create_task(monitor_gpus())
         task_io = TaskIO()
         task_io_loop = asyncio.create_task(task_io.start())
-        gpu_workers = [ProcessorWorker(gpu_id, args.max_memory, args.max_util, args.grace_period) for gpu_id in range(pynvml.nvmlDeviceGetCount())]
+        gpu_workers = [ProcessorWorker(gpu_id, args.max_memory, args.max_util, args.grace_period, args.debug) for gpu_id in range(pynvml.nvmlDeviceGetCount())]
         gpu_worker_loops = [asyncio.create_task(gpu_worker.start(task_io.task_queue, task_io.message_queue, task_io.task_pool, task_io.task_pool_lock)) for gpu_worker in gpu_workers]
         console_printer_loop = asyncio.create_task(console_printer(gpu_workers, task_io.task_queue))
         await asyncio.sleep(float('inf'))
