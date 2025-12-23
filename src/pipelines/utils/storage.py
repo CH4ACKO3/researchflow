@@ -187,10 +187,11 @@ class MetadataStorage:
             logger.error(f"Failed to save index file: {e}")
             raise
     
-    def cleanup_orphaned_files(self, clean_entries: bool = False):
+    def cleanup_orphaned_files(self, clean_entries: bool = False, clean_unfinished: bool = False):
         """        
         Args:
             clean_entries: If True, also remove index entries that have no attachments
+            clean_unfinished: If True, also remove index entries that are not finished
         """
         try:
             self._acquire_lock()
@@ -230,6 +231,19 @@ class MetadataStorage:
 
             def has_valid_paths(attachments: Dict[str, Any]) -> bool:
                 """Check if attachments contain any valid file or directory paths"""
+                def has_any_file(dir_path: Path) -> bool:
+                    """Recursively check if directory contains at least one file"""
+                    try:
+                        for item in dir_path.iterdir():
+                            if item.is_file():
+                                return True
+                            elif item.is_dir():
+                                if has_any_file(item):
+                                    return True
+                    except Exception:
+                        pass
+                    return False
+                
                 for key, value in attachments.items():
                     if isinstance(value, dict):
                         # Nested dictionary, recurse
@@ -251,12 +265,9 @@ class MetadataStorage:
                             # File exists
                             return True
                         elif full_path.is_dir():
-                            # Directory exists and is not empty
-                            try:
-                                if any(full_path.iterdir()):
-                                    return True
-                            except Exception:
-                                pass
+                            # Directory exists and contains at least one file
+                            if has_any_file(full_path):
+                                return True
                 return False
 
             # Collect retained files from all index entries' attachments
@@ -264,6 +275,9 @@ class MetadataStorage:
                 attachments = entry_info.get("attachments", {})
                 collect_retained_paths(attachments)
                 # Check if entry should be marked as orphaned
+                if entry_info.get("extra_info", {}).get("finished", False) == False and clean_unfinished:
+                    orphaned_index_entries.add(uuid_val)
+                    continue
                 if not has_valid_paths(attachments):
                     orphaned_index_entries.add(uuid_val)
 
@@ -609,7 +623,14 @@ class MetadataStorage:
                         for item in attachment:
                             recursive_delete(item)
                     else:
-                        (self.storage_dir / attachment).unlink(missing_ok=True)
+                        path = self.storage_dir / attachment
+                        if path.is_file():
+                            path.unlink(missing_ok=True)
+                        elif path.is_dir():
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            # Path doesn't exist, safe to ignore
+                            pass
             
             for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
                 attachments: Dict[str, Any] = matched_entry.get("attachments", {})
