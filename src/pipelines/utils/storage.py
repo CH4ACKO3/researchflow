@@ -32,6 +32,7 @@ class MetadataStorage:
         """
         self.storage_dir: Path = Path(storage_dir)
         self.index_file: Path = self.storage_dir / "index.json"
+        self.index_file_backup: Path = self.storage_dir / "index.json.backup"
         self.lock_file: Path = self.storage_dir / ".lock"
         self.index_data: Dict[str, Any] = {}
         self._lock_count: int = 0  # Lock reference count
@@ -117,26 +118,63 @@ class MetadataStorage:
                 pass
     
     def _load_index(self):
-        """Load index file (assumes lock is already held)"""
+        """Load index file with fallback to backup if corrupted"""
+        # Try loading main index file
         if self.index_file.exists():
             try:
                 with open(self.index_file, 'r', encoding='utf-8') as f:
                     self.index_data = json.load(f)
                     logger.debug(f"Index file loaded, containing {len(self.index_data)} records")
+                return
             except Exception as e:
                 logger.error(f"Failed to load index file: {e}")
+                # Try loading backup
+                if self.index_file_backup.exists():
+                    try:
+                        with open(self.index_file_backup, 'r', encoding='utf-8') as f:
+                            self.index_data = json.load(f)
+                            logger.warning(f"Loaded index from backup, containing {len(self.index_data)} records")
+                            # Restore backup to main file
+                            shutil.copy2(self.index_file_backup, self.index_file)
+                            logger.info("Restored index file from backup")
+                        return
+                    except Exception as backup_error:
+                        logger.error(f"Failed to load backup index file: {backup_error}")
+                
+                # Both main and backup failed, start fresh
+                logger.warning("Both index and backup failed to load, creating new index")
                 self.index_data = {}
         else:
             logger.debug("Index file does not exist, creating new index")
             self.index_data = {}
     
     def _save_index(self):
-        """Save index file (assumes lock is already held)"""
+        """Save index file atomically with backup"""
+        temp_file = self.storage_dir / f".index.json.tmp.{uuid.uuid4()}"
         try:
-            with open(self.index_file, 'w', encoding='utf-8') as f:
+            # Write to temporary file first
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.index_data, f, ensure_ascii=False, indent=2)
-                logger.debug("Index file saved successfully")
+                # Ensure data is written to disk
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Backup current index file if it exists
+            if self.index_file.exists():
+                shutil.copy2(self.index_file, self.index_file_backup)
+            
+            # Atomically replace the index file
+            # os.replace() is atomic on both Unix and Windows
+            os.replace(temp_file, self.index_file)
+            
+            logger.debug("Index file saved successfully")
         except Exception as e:
+            # Clean up temporary file if it exists
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
             logger.error(f"Failed to save index file: {e}")
             raise
     
@@ -220,10 +258,16 @@ class MetadataStorage:
                 if not has_valid_paths(attachments):
                     orphaned_index_entries.add(uuid_val)
 
-            # Get all files currently in storage directory (excluding index.json and .lock)
+            # Get all files currently in storage directory (excluding system files)
+            excluded_files = {
+                self.index_file.name,
+                self.index_file_backup.name,
+                self.lock_file.name
+            }
             storage_files = set()
             for file_path in self.storage_dir.iterdir():
-                if file_path.is_file() and file_path.name not in [self.index_file.name, self.lock_file.name]:
+                # Exclude system files and temporary files
+                if file_path.is_file() and file_path.name not in excluded_files and not file_path.name.startswith('.index.json.tmp'):
                     storage_files.add(file_path.name)
 
             # Find orphaned files (files in storage but not in retained set)
@@ -386,7 +430,7 @@ class MetadataStorage:
             self._release_lock()
     
     def _traverse_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """Internal search method that doesn't acquire locks (assumes lock is already held)"""
+        """Internal search method that doesn't acquire locks """
         if uuid_query is None and metadata_query is None:
             return list(self.index_data.values()), list(self.index_data.keys())
         
