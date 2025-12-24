@@ -49,7 +49,7 @@ class MetadataStorage:
             return
         
         # First time acquiring lock: actually acquire system lock
-        max_retries = 10
+        max_retries = 20
         retry_delay = 0.1
         
         for attempt in range(max_retries):
@@ -69,7 +69,7 @@ class MetadataStorage:
                 if attempt < max_retries - 1:
                     logger.debug(f"Directory is locked, retrying in {retry_delay}s (attempt {attempt + 1})")
                     time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 2.0)
+                    retry_delay = min(retry_delay * 2.0, 1.0)
                 else:
                     logger.error(f"Failed to acquire directory lock after {max_retries} attempts")
                     raise RuntimeError("Failed to acquire directory lock")
