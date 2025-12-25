@@ -1,12 +1,12 @@
 import os
 import json
-import uuid
 import shutil
 import time
 import fcntl
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple
 import logging
+import random
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -49,8 +49,8 @@ class MetadataStorage:
             return
         
         # First time acquiring lock: actually acquire system lock
-        max_retries = 10
-        retry_delay = 0.1
+        max_retries = 50
+        retry_delay = 0.01  # Start with 10ms
         
         for attempt in range(max_retries):
             try:
@@ -67,17 +67,23 @@ class MetadataStorage:
             except BlockingIOError:
                 # Lock is held by another process
                 if attempt < max_retries - 1:
-                    logger.debug(f"Directory is locked, retrying in {retry_delay}s (attempt {attempt + 1})")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 2.0)
+                    # Add jitter (randomization) to avoid thundering herd problem
+                    jitter = random.uniform(0, retry_delay * 0.5)
+                    actual_delay = retry_delay + jitter
+                    logger.debug(f"Directory is locked, retrying in {actual_delay:.3f}s (attempt {attempt + 1})")
+                    time.sleep(actual_delay)
+                    retry_delay = min(retry_delay * 1.5, 0.2)  # Max 200ms delay
                 else:
                     logger.error(f"Failed to acquire directory lock after {max_retries} attempts")
                     raise RuntimeError("Failed to acquire directory lock")
             except Exception as e:
                 if attempt < max_retries - 1:
+                    # Add jitter for other exceptions as well
+                    jitter = random.uniform(0, retry_delay * 0.5)
+                    actual_delay = retry_delay + jitter
                     logger.warning(f"Failed to acquire lock (attempt {attempt + 1}): {e}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
+                    time.sleep(actual_delay)
+                    retry_delay = min(retry_delay * 1.5, 0.2)
                 else:
                     logger.error(f"Failed to acquire lock after {max_retries} attempts: {e}")
                     raise
@@ -150,16 +156,16 @@ class MetadataStorage:
     
     def _save_index(self):
         """Save index file atomically with backup"""
-        temp_file = self.storage_dir / f".index.json.tmp.{uuid.uuid4()}"
+        temp_file = self.storage_dir / f".index.json.tmp.{uuid4()}"
         try:
             # Custom encoder to handle Path objects and other non-serializable types
             class PathEncoder(json.JSONEncoder):
-                def default(self, obj):
+                def default(self, o):
                     # Handle Path and its subclasses (PosixPath, WindowsPath, etc.)
-                    if isinstance(obj, Path):
-                        return str(obj)
+                    if isinstance(o, Path):
+                        return str(o)
                     # Let the base class raise TypeError for other non-serializable types
-                    return super().default(obj)
+                    return super().default(o)
             
             # Write to temporary file first
             with open(temp_file, 'w', encoding='utf-8') as f:
@@ -187,10 +193,11 @@ class MetadataStorage:
             logger.error(f"Failed to save index file: {e}")
             raise
     
-    def cleanup_orphaned_files(self, clean_entries: bool = False):
+    def cleanup_orphaned_files(self, clean_entries: bool = False, clean_unfinished: bool = False):
         """        
         Args:
             clean_entries: If True, also remove index entries that have no attachments
+            clean_unfinished: If True, also remove index entries that are not finished
         """
         try:
             self._acquire_lock()
@@ -230,6 +237,19 @@ class MetadataStorage:
 
             def has_valid_paths(attachments: Dict[str, Any]) -> bool:
                 """Check if attachments contain any valid file or directory paths"""
+                def has_any_file(dir_path: Path) -> bool:
+                    """Recursively check if directory contains at least one file"""
+                    try:
+                        for item in dir_path.iterdir():
+                            if item.is_file():
+                                return True
+                            elif item.is_dir():
+                                if has_any_file(item):
+                                    return True
+                    except Exception:
+                        pass
+                    return False
+                
                 for key, value in attachments.items():
                     if isinstance(value, dict):
                         # Nested dictionary, recurse
@@ -251,12 +271,9 @@ class MetadataStorage:
                             # File exists
                             return True
                         elif full_path.is_dir():
-                            # Directory exists and is not empty
-                            try:
-                                if any(full_path.iterdir()):
-                                    return True
-                            except Exception:
-                                pass
+                            # Directory exists and contains at least one file
+                            if has_any_file(full_path):
+                                return True
                 return False
 
             # Collect retained files from all index entries' attachments
@@ -264,6 +281,9 @@ class MetadataStorage:
                 attachments = entry_info.get("attachments", {})
                 collect_retained_paths(attachments)
                 # Check if entry should be marked as orphaned
+                if entry_info.get("extra_info", {}).get("finished", False) == False and clean_unfinished:
+                    orphaned_index_entries.add(uuid_val)
+                    continue
                 if not has_valid_paths(attachments):
                     orphaned_index_entries.add(uuid_val)
 
@@ -298,7 +318,7 @@ class MetadataStorage:
             # Save index if any changes were made
             if orphaned_files or (clean_entries and orphaned_index_entries):
                 self._save_index()
-                logger.info(f"Cleanup completed: removed {len(orphaned_files)} orphaned files and {len(orphaned_index_entries)} orphaned index entries")
+                logger.debug(f"Cleanup completed: removed {len(orphaned_files)} orphaned files and {len(orphaned_index_entries)} orphaned index entries")
             else:
                 logger.debug("No cleanup needed - all files and index entries are consistent")
 
@@ -307,7 +327,7 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None) -> str:
+    def create_entry(self, uuid: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_overwrite: Optional[Union[str, bool]] = "finished") -> str:
         """
         Create or update an entry
         
@@ -338,6 +358,16 @@ class MetadataStorage:
                     raise ValueError(f"Multiple entries found with matching metadata: {matched_uuids}")
                 elif len(matched_uuids) == 1:
                     # Overwrite existing entry
+                    if allow_overwrite == "finished":
+                        if not self.index_data[matched_uuids[0]].get("extra_info", {}).get("finished", False) == True:
+                            raise ValueError(f"Entry {matched_uuids[0]} is not finished, cannot overwrite")
+                    elif allow_overwrite == True:
+                        pass
+                    elif allow_overwrite == False:
+                        raise ValueError(f"Entry {matched_uuids[0]} already exists, cannot overwrite")
+                    else:
+                        raise ValueError(f"Invalid allow_overwrite value: {allow_overwrite}")
+
                     uuid = matched_uuids[0]
                     logger.debug(f"Found existing entry with matching metadata, overwriting: {uuid}")
                     self.update_entry(uuid, metadata, extra_info, attachments)
@@ -372,69 +402,81 @@ class MetadataStorage:
 
         return uuid
 
-    def update_entry(self, uuid: str, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None):
+    def update_entry(self, uuid_query: Optional[Union[List[str], str]] = None, metadata: Optional[Dict[str, Any]] = None, extra_info: Optional[Dict[str, Any]] = None, attachments: Optional[Dict[str, Any]] = None, allow_multiple: bool = False):
         """
         Update entry and record metadata
         
         Args:
-            uuid: UUID of the entry to update
+            uuid: UUID of the entry to update, if None, update all entries
             metadata: Entry metadata information
             extra_info: Extra information to store with the entry
             attachments: Attachments to store with the entry
+            allow_multiple: If True, allow updating multiple entries
         Returns:
             str: UUID of updated entry
         """
+        if uuid_query is None and not allow_multiple:
+            raise ValueError("Must allow_multiple when uuid_query is None")
+        
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError(f"Metadata must be a dictionary: {metadata}")
         if extra_info is not None and not isinstance(extra_info, dict):
             raise ValueError(f"Extra information must be a dictionary: {extra_info}")
         if attachments is not None and not isinstance(attachments, dict):
             raise ValueError(f"Attachments must be a dictionary: {attachments}")
-            
+        
         try:
             self._acquire_lock()
             
-            matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid)
-
-            if len(matched_entries) != 1:
-                raise ValueError(f"Multiple or no entries found for UUID: {uuid}")
-            matched_entry = matched_entries[0]
-
-            if metadata is not None:
-                matched_entry["metadata"].update(metadata)
-            if extra_info is not None:
-                matched_entry["extra_info"].update(extra_info)
-            if attachments is not None:
-                # Ensure directories in attachments exist
-                def ensure_directories(attachments: Dict[str, Any]):
-                    """Recursively ensure directories in attachments exist"""
-                    for key, value in attachments.items():
-                        if isinstance(value, dict):
-                            # Nested dictionary, recurse
-                            ensure_directories(value)
-                        elif isinstance(value, str):
-                            path = Path(value)
-                            if path.is_absolute():
-                                try:
-                                    path = path.relative_to(self.storage_dir)
-                                except ValueError:
-                                    continue
-                            
-                            full_path = self.storage_dir / path
-                            if not full_path.exists():
-                                try:
-                                    full_path.mkdir(parents=True, exist_ok=True)
-                                    logger.debug(f"Created directory: {full_path}")
-                                except Exception as e:
-                                    logger.warning(f"Failed to create directory {full_path}: {e}")
-                            elif full_path.is_file():
-                                pass
+            if uuid_query is None:
+                matched_entries, matched_uuids = self._traverse_entries(metadata_query={})
+                if len(matched_entries) == 0:
+                    raise ValueError(f"No entries found for metadata: {metadata}")
+            else:
+                matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query)
+                if len(matched_entries) == 0:
+                    raise ValueError(f"No entries found for UUID: {uuid_query}")
+                if len(matched_entries) > 1 and not allow_multiple:
+                    raise ValueError(f"Multiple entries found for UUID: {uuid_query}, but allow_multiple is False")
                 
-                ensure_directories(attachments)
-                matched_entry["attachments"].update(attachments)
+            for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
+                if metadata is not None:
+                    matched_entry["metadata"].update(metadata)
+                if extra_info is not None:
+                    matched_entry["extra_info"].update(extra_info)
+                if attachments is not None:
+                    # Ensure directories in attachments exist
+                    def ensure_directories(attachments: Dict[str, Any]):
+                        """Recursively ensure directories in attachments exist"""
+                        for key, value in attachments.items():
+                            logger.debug(f"Checking attachment directory: {key} -> {value}")
+                            if isinstance(value, dict):
+                                # Nested dictionary, recurse
+                                ensure_directories(value)
+                            elif isinstance(value, str):
+                                path = Path(value)
+                                if path.is_absolute():
+                                    try:
+                                        path = path.relative_to(self.storage_dir)
+                                    except ValueError:
+                                        continue
+                                
+                                full_path = self.storage_dir / path
+                                if not full_path.exists():
+                                    try:
+                                        full_path.mkdir(parents=True, exist_ok=True)
+                                        logger.debug(f"Created directory: {full_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to create directory {full_path}: {e}")
+                                elif full_path.is_file():
+                                    pass
+                    
+                    logger.debug(f"Updated attachments: {attachments}")
+                    ensure_directories(attachments)
+                    matched_entry["attachments"].update(attachments)
             
             self._save_index()
-            logger.debug(f"Updated entry: {uuid}")
+            logger.debug(f"Updated entry: {uuid_query}")
         finally:
             self._release_lock()
     
@@ -452,7 +494,6 @@ class MetadataStorage:
                 if entry_uuid in uuid_query:
                     matched_entires.append(entry_data)
                     matched_uuids.append(entry_uuid)
-                    break
             
         elif metadata_query is not None:
             for entry_uuid, entry_data in self.index_data.items():
@@ -587,13 +628,22 @@ class MetadataStorage:
                         for item in attachment:
                             recursive_delete(item)
                     else:
-                        (self.storage_dir / attachment).unlink()
+                        path = self.storage_dir / attachment
+                        if path.is_file():
+                            path.unlink(missing_ok=True)
+                        elif path.is_dir():
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            # Path doesn't exist, safe to ignore
+                            pass
             
             for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
                 attachments: Dict[str, Any] = matched_entry.get("attachments", {})
                 try:
                     recursive_delete(attachments)
-                    self.index_data.pop(matched_uuid)
+                    logger.debug(f"Deleted attachments: {attachments}")
+                    del self.index_data[matched_uuid]
+                    logger.debug(f"Deleted entry: {matched_uuid}")
                     deleted_count += 1
                 except Exception as e:
                     logger.error(f"Failed to delete entry {matched_uuid}: {e}")
