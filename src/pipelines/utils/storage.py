@@ -7,6 +7,7 @@ import fcntl
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple
 import logging
+import random
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -67,16 +68,22 @@ class MetadataStorage:
             except BlockingIOError:
                 # Lock is held by another process
                 if attempt < max_retries - 1:
-                    logger.debug(f"Directory is locked, retrying in {retry_delay}s (attempt {attempt + 1})")
-                    time.sleep(retry_delay)
+                    # Add jitter (randomization) to avoid thundering herd problem
+                    jitter = random.uniform(0, retry_delay * 0.5)
+                    actual_delay = retry_delay + jitter
+                    logger.debug(f"Directory is locked, retrying in {actual_delay:.3f}s (attempt {attempt + 1})")
+                    time.sleep(actual_delay)
                     retry_delay = min(retry_delay * 2.0, 1.0)
                 else:
                     logger.error(f"Failed to acquire directory lock after {max_retries} attempts")
                     raise RuntimeError("Failed to acquire directory lock")
             except Exception as e:
                 if attempt < max_retries - 1:
+                    # Add jitter for other exceptions as well
+                    jitter = random.uniform(0, retry_delay * 0.5)
+                    actual_delay = retry_delay + jitter
                     logger.warning(f"Failed to acquire lock (attempt {attempt + 1}): {e}")
-                    time.sleep(retry_delay)
+                    time.sleep(actual_delay)
                     retry_delay *= 2
                 else:
                     logger.error(f"Failed to acquire lock after {max_retries} attempts: {e}")
@@ -154,12 +161,12 @@ class MetadataStorage:
         try:
             # Custom encoder to handle Path objects and other non-serializable types
             class PathEncoder(json.JSONEncoder):
-                def default(self, obj):
+                def default(self, o):
                     # Handle Path and its subclasses (PosixPath, WindowsPath, etc.)
-                    if isinstance(obj, Path):
-                        return str(obj)
+                    if isinstance(o, Path):
+                        return str(o)
                     # Let the base class raise TypeError for other non-serializable types
-                    return super().default(obj)
+                    return super().default(o)
             
             # Write to temporary file first
             with open(temp_file, 'w', encoding='utf-8') as f:
