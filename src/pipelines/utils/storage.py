@@ -453,23 +453,32 @@ class MetadataStorage:
                             if isinstance(value, dict):
                                 # Nested dictionary, recurse
                                 ensure_directories(value)
-                            elif isinstance(value, str):
-                                path = Path(value)
+                            elif isinstance(value, str) or isinstance(value, Path):
+                                if isinstance(value, str):
+                                    try:
+                                        value = Path(value)
+                                    except Exception as e:
+                                        raise ValueError(f"Invalid attachment path: {value}: {e}")
+                                path = value
                                 if path.is_absolute():
                                     try:
                                         path = path.relative_to(self.storage_dir)
                                     except ValueError:
                                         continue
-                                
                                 full_path = self.storage_dir / path
-                                if not full_path.exists():
-                                    try:
-                                        full_path.mkdir(parents=True, exist_ok=True)
-                                        logger.debug(f"Created directory: {full_path}")
-                                    except Exception as e:
-                                        logger.warning(f"Failed to create directory {full_path}: {e}")
+                                if full_path.is_dir():
+                                    if not full_path.exists():
+                                        try:
+                                            full_path.mkdir(parents=True, exist_ok=True)
+                                            logger.debug(f"Created directory: {full_path}")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to create directory {full_path}: {e}")
                                 elif full_path.is_file():
                                     pass
+                                else:
+                                    raise ValueError(f"Invalid attachment path: {path}")
+                            else:
+                                raise ValueError(f"Invalid attachment type: {type(value)}")
                     
                     logger.debug(f"Updated attachments: {attachments}")
                     ensure_directories(attachments)
