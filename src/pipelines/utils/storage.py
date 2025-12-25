@@ -49,8 +49,8 @@ class MetadataStorage:
             return
         
         # First time acquiring lock: actually acquire system lock
-        max_retries = 20
-        retry_delay = 0.1
+        max_retries = 50
+        retry_delay = 0.01  # Start with 10ms
         
         for attempt in range(max_retries):
             try:
@@ -72,7 +72,7 @@ class MetadataStorage:
                     actual_delay = retry_delay + jitter
                     logger.debug(f"Directory is locked, retrying in {actual_delay:.3f}s (attempt {attempt + 1})")
                     time.sleep(actual_delay)
-                    retry_delay = min(retry_delay * 2.0, 1.0)
+                    retry_delay = min(retry_delay * 1.5, 0.2)  # Max 200ms delay
                 else:
                     logger.error(f"Failed to acquire directory lock after {max_retries} attempts")
                     raise RuntimeError("Failed to acquire directory lock")
@@ -83,7 +83,7 @@ class MetadataStorage:
                     actual_delay = retry_delay + jitter
                     logger.warning(f"Failed to acquire lock (attempt {attempt + 1}): {e}")
                     time.sleep(actual_delay)
-                    retry_delay *= 2
+                    retry_delay = min(retry_delay * 1.5, 0.2)
                 else:
                     logger.error(f"Failed to acquire lock after {max_retries} attempts: {e}")
                     raise

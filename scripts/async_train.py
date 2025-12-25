@@ -363,10 +363,9 @@ class ProcessorWorker:
                                     if task in self.task_pool["waiting"]:
                                         try:
                                             proc = subprocess.Popen(f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}{' --debug' if self.debug else ''}", shell=True, stdout=LOG_FILE, stderr=LOG_FILE)
-                                            async with self.status_lock:
-                                                self.running_proc[task] = proc
-                                                self.task_start_times[task] = time.time()
-                                                self.status = "running"
+                                            self.running_proc[task] = proc
+                                            self.task_start_times[task] = time.time()
+                                            self.status = "running"
                                             self.message_queue.put_nowait((task, "running"))
                                             history_logger.info(f"GPU {self.gpu_id} started task: {task}")
                                         except (OSError, subprocess.SubprocessError) as e:
@@ -390,21 +389,18 @@ class ProcessorWorker:
                                         status = "terminated"
                                         history_logger.warning(f"GPU {self.gpu_id} terminated task with code {proc_status}: {task}")
                                     self.message_queue.put_nowait((task, status))
-                                    async with self.status_lock:
-                                        self.task_start_times.pop(task, None)
+                                    self.task_start_times.pop(task, None)
                                 elif not self_available:
                                     tasks_to_remove.append(task)
                                     self.message_queue.put_nowait((task, "waiting"))
-                                    async with self.status_lock:
-                                        self.task_start_times.pop(task, None)
+                                    self.task_start_times.pop(task, None)
                                     proc.terminate()
                                     history_logger.info(f"GPU {self.gpu_id} terminated task (GPU unavailable): {task}")
                                 elif system_memory_pct >= 90.0:
                                     # Stop task if system memory exceeds 90%
                                     tasks_to_remove.append(task)
                                     self.message_queue.put_nowait((task, "waiting"))
-                                    async with self.status_lock:
-                                        self.task_start_times.pop(task, None)
+                                    self.task_start_times.pop(task, None)
                                     proc.terminate()
                                     history_logger.warning(f"GPU {self.gpu_id} terminated task (high system memory): {task}")
                                 else:
