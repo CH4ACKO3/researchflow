@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import shutil
 import time
 import fcntl
@@ -157,7 +156,7 @@ class MetadataStorage:
     
     def _save_index(self):
         """Save index file atomically with backup"""
-        temp_file = self.storage_dir / f".index.json.tmp.{uuid.uuid4()}"
+        temp_file = self.storage_dir / f".index.json.tmp.{uuid4()}"
         try:
             # Custom encoder to handle Path objects and other non-serializable types
             class PathEncoder(json.JSONEncoder):
@@ -436,9 +435,9 @@ class MetadataStorage:
             else:
                 matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query)
                 if len(matched_entries) == 0:
-                    raise ValueError(f"No entries found for UUID: {uuid}")
+                    raise ValueError(f"No entries found for UUID: {uuid_query}")
                 if len(matched_entries) > 1 and not allow_multiple:
-                    raise ValueError(f"Multiple entries found for UUID: {uuid}, but allow_multiple is False")
+                    raise ValueError(f"Multiple entries found for UUID: {uuid_query}, but allow_multiple is False")
                 
             for matched_entry, matched_uuid in zip(matched_entries, matched_uuids):
                 if metadata is not None:
@@ -477,7 +476,7 @@ class MetadataStorage:
                     matched_entry["attachments"].update(attachments)
             
             self._save_index()
-            logger.debug(f"Updated entry: {uuid}")
+            logger.debug(f"Updated entry: {uuid_query}")
         finally:
             self._release_lock()
     
