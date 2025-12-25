@@ -466,17 +466,24 @@ class MetadataStorage:
                                     except ValueError:
                                         continue
                                 full_path = self.storage_dir / path
-                                if full_path.is_dir():
-                                    if not full_path.exists():
+                                
+                                if not full_path.exists():
+                                    if '.' in str(path):
+                                        # Likely a file, create parent directory
+                                        parent_dir = full_path.parent
+                                        if not parent_dir.exists():
+                                            try:
+                                                parent_dir.mkdir(parents=True, exist_ok=True)
+                                                logger.debug(f"Created parent directory: {parent_dir}")
+                                            except Exception as e:
+                                                logger.warning(f"Failed to create parent directory {parent_dir}: {e}")
+                                    else:
+                                        # Likely a directory, create it
                                         try:
                                             full_path.mkdir(parents=True, exist_ok=True)
                                             logger.debug(f"Created directory: {full_path}")
                                         except Exception as e:
                                             logger.warning(f"Failed to create directory {full_path}: {e}")
-                                elif full_path.is_file():
-                                    pass
-                                else:
-                                    raise ValueError(f"Invalid attachment path: {path}")
                             else:
                                 raise ValueError(f"Invalid attachment type: {type(value)}")
                     
