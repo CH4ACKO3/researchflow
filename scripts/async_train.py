@@ -58,8 +58,6 @@ console_handler.setFormatter(formatter)
 console_logger.addHandler(console_handler)
 console_logger.propagate = False
 
-LOG_FILE = log_file_path.open("a")
-
 # Global gpu status
 available_gpus = []
 gpus_lock = asyncio.Lock()
@@ -285,7 +283,8 @@ class ProcessorWorker:
         self.util = deque(maxlen=60)
         self.memory.append(0)
         self.util.append(0)
-        self.running_proc = dict() 
+        self.running_proc = dict()
+        self.log_readers = dict()  # task -> (stdout_task, stderr_task)
         self.debug = debug
 
     async def start(self, task_queue, message_queue, task_pool, task_pool_lock):
@@ -299,6 +298,25 @@ class ProcessorWorker:
     async def stop(self):
         self.schedule_loop.cancel()
         await asyncio.gather(self.schedule_loop, return_exceptions=True)
+
+    async def read_stream(self, task, stream, stream_name):
+        """Async read subprocess output and log it"""
+        try:
+            loop = asyncio.get_event_loop()
+            while True:
+                line = await loop.run_in_executor(None, stream.readline)
+                if not line:
+                    break
+                line_str = line.decode('utf-8', errors='replace').rstrip()
+                if line_str:
+                    history_logger.info(f"[GPU {self.gpu_id}] [{task}] {line_str}")
+        except Exception as e:
+            history_logger.debug(f"Error reading {stream_name} for task {task}: {e}")
+        finally:
+            try:
+                stream.close()
+            except:
+                pass
 
     async def generate_status_info(self):
         try:
@@ -362,9 +380,20 @@ class ProcessorWorker:
                                 async with self.task_pool_lock:
                                     if task in self.task_pool["waiting"]:
                                         try:
-                                            proc = subprocess.Popen(f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}{' --debug' if self.debug else ''}", shell=True, stdout=LOG_FILE, stderr=LOG_FILE)
+                                            proc = subprocess.Popen(
+                                                f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}{' --debug' if self.debug else ''}", 
+                                                shell=True, 
+                                                stdout=subprocess.PIPE, 
+                                                stderr=subprocess.PIPE
+                                            )
                                             self.running_proc[task] = proc
                                             self.task_start_times[task] = time.time()
+                                            
+                                            # Start async tasks to read stdout and stderr
+                                            stdout_task = asyncio.create_task(self.read_stream(task, proc.stdout, "stdout"))
+                                            stderr_task = asyncio.create_task(self.read_stream(task, proc.stderr, "stderr"))
+                                            self.log_readers[task] = (stdout_task, stderr_task)
+                                            
                                             self.status = "running"
                                             self.message_queue.put_nowait((task, "running"))
                                             history_logger.info(f"GPU {self.gpu_id} started task: {task}")
@@ -415,6 +444,11 @@ class ProcessorWorker:
                             
                             for task in tasks_to_remove:
                                 self.running_proc.pop(task, None)
+                                # Cancel and cleanup log reader tasks
+                                if task in self.log_readers:
+                                    stdout_task, stderr_task = self.log_readers.pop(task)
+                                    stdout_task.cancel()
+                                    stderr_task.cancel()
 
                 except asyncio.CancelledError:
                     raise
@@ -433,6 +467,12 @@ class ProcessorWorker:
                         history_logger.info(f"GPU {self.gpu_id} terminated task during shutdown: {task}")
                     except Exception as e:
                         history_logger.error(f"Error terminating process for task {task}: {e}")
+                
+                # Cancel all log reader tasks
+                for task, (stdout_task, stderr_task) in self.log_readers.items():
+                    stdout_task.cancel()
+                    stderr_task.cancel()
+                self.log_readers.clear()
 
 async def monitor_gpus():
     global available_gpus
