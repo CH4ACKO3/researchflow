@@ -373,6 +373,8 @@ class ProcessorWorker:
                             and system_memory_pct < 60.0 \
                             and (self.last_task_time is None or time.time() - self.last_task_time > self.grace_period):
                             self.status = "idle"
+                        elif self_available and self.last_task_time is None:
+                            self.status = "occupied"
                             
                         if self.status == "idle":
                             try:
