@@ -309,7 +309,7 @@ class ProcessorWorker:
                     break
                 line_str = line.decode('utf-8', errors='replace').rstrip()
                 if line_str:
-                    history_logger.info(f"[GPU {self.gpu_id}] [{task}] {line_str}")
+                    history_logger.info(f"[GPU {self.gpu_id}] {line_str}")
         except Exception as e:
             history_logger.debug(f"Error reading {stream_name} for task {task}: {e}")
         finally:
