@@ -49,7 +49,8 @@ class TestMetadataStorage:
         assert uuids[0] == uuid
         assert entries[0]["uuid"] == uuid
         assert entries[0]["metadata"] == {}
-        assert entries[0]["extra_info"] == {}
+        # Note: read_entries() automatically adds last_access_time
+        assert "last_access_time" in entries[0]["extra_info"]
         assert entries[0]["attachments"] == {}
     
     def test_create_entry_with_uuid(self, storage):
@@ -84,7 +85,12 @@ class TestMetadataStorage:
         uuid = storage.create_entry(extra_info=extra_info)
         
         entries, uuids = storage.read_entries(uuid_query=uuid)
-        assert entries[0]["extra_info"] == extra_info
+        # Check that all provided extra_info is present
+        for key, value in extra_info.items():
+            assert key in entries[0]["extra_info"]
+            assert entries[0]["extra_info"][key] == value
+        # Note: read_entries() also adds last_access_time
+        assert "last_access_time" in entries[0]["extra_info"]
     
     def test_create_entry_with_attachments(self, storage):
         """Test entry creation with attachments"""
@@ -139,7 +145,7 @@ class TestMetadataStorage:
     
     def test_update_entry_nonexistent(self, storage):
         """Test updating non-existent entry raises error"""
-        with pytest.raises(ValueError, match="Multiple or no entries found"):
+        with pytest.raises(ValueError, match="No entries found"):
             storage.update_entry("nonexistent-uuid", metadata={"key": "value"})
     
     def test_update_entry_invalid_metadata(self, storage):
@@ -166,12 +172,10 @@ class TestMetadataStorage:
         assert uuids[0] == uuid1
         assert entries[0]["metadata"]["name"] == "entry1"
         
-        # Note: Current implementation only returns first match for UUID query
-        # This test reflects actual behavior
+        # Query with list of UUIDs should return all matching entries
         entries, uuids = storage.read_entries(uuid_query=[uuid1, uuid2])
-        # The current implementation has a break statement, so it only returns one
-        assert len(entries) == 1
-        assert uuids[0] in {uuid1, uuid2}
+        assert len(entries) == 2
+        assert set(uuids) == {uuid1, uuid2}
     
     def test_read_entries_by_metadata_partial_match(self, storage):
         """Test reading entries by metadata with partial match"""

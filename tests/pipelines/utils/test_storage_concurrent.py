@@ -366,13 +366,18 @@ class TestMetadataStorageConcurrent:
         # Verify no duplicate UUIDs
         assert len(set(all_uuids)) == len(all_uuids), "Duplicate UUIDs found"
         
-        # Verify index file is valid JSON
-        index_file = storage.index_file
-        assert index_file.exists()
-        import json
-        with open(index_file, 'r') as f:
-            index_data = json.load(f)
-            assert isinstance(index_data, dict)
+        # Verify database file exists and is valid (now using SQLite)
+        db_file = storage.db_file
+        assert db_file.exists(), f"Database file {db_file} does not exist"
+        
+        # Verify we can query the database
+        import sqlite3
+        conn = sqlite3.connect(str(db_file))
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM entries")
+        count = cursor.fetchone()[0]
+        conn.close()
+        assert count == len(all_entries), "Database entry count mismatch"
     
     def test_lock_nested_operations(self, storage):
         """Test that nested operations work correctly with locking"""

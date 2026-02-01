@@ -3,6 +3,7 @@ import json
 import shutil
 import time
 import fcntl
+import sqlite3
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple
 import logging
@@ -49,14 +50,20 @@ class In:
 
 class MetadataStorage:
     """
-    JSON-based indexed file storage system with directory-level locking
+    SQLite-based indexed file storage system with directory-level locking
     
     Features:
-    1. Create UUID-named files when storing files and record metadata in index
-    2. Query matching files based on metadata
+    1. Create UUID-named files when storing files and record metadata in SQLite database
+    2. Query matching files based on metadata using efficient SQL queries
     3. Support partial metadata matching queries with In wrapper for multi-value matching
     4. Directory-level locking to prevent concurrent access
     5. Automatic tracking of last access time for each entry
+    6. WAL mode for improved concurrency
+    
+    Storage Backend:
+        Uses SQLite database (index.db) with EAV (Entity-Attribute-Value) model
+        for flexible metadata storage. Automatically migrates from legacy JSON
+        format if index.json is found.
     
     Multi-value matching:
         Use the In wrapper to match entries where a field value is in a list of values:
@@ -85,12 +92,355 @@ class MetadataStorage:
         self.storage_dir: Path = Path(storage_dir)
         self.index_file: Path = self.storage_dir / "index.json"
         self.index_file_backup: Path = self.storage_dir / "index.json.backup"
+        self.db_file: Path = self.storage_dir / "index.db"
         self.lock_file: Path = self.storage_dir / ".lock"
         self.index_data: Dict[str, Any] = {}
         self._lock_count: int = 0  # Lock reference count
+        self.use_sqlite: bool = True  # Use SQLite backend by default
 
         # Create storage directory
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize database and handle migration
+        if self.use_sqlite:
+            # Check if we need to migrate from JSON
+            if self.index_file.exists() and not self.db_file.exists():
+                logger.info("Detected JSON index, migrating to SQLite...")
+                # Load JSON data first
+                try:
+                    with open(self.index_file, 'r', encoding='utf-8') as f:
+                        self.index_data = json.load(f)
+                    logger.info(f"Loaded {len(self.index_data)} entries from JSON")
+                except Exception as e:
+                    logger.error(f"Failed to load JSON for migration: {e}")
+                    self.index_data = {}
+                
+                # Initialize database and migrate
+                self._init_database()
+                if self.index_data:
+                    self._migrate_json_to_sqlite()
+                    # Rename old JSON file to backup
+                    migrated_file = self.storage_dir / "index.json.migrated"
+                    shutil.move(self.index_file, migrated_file)
+                    logger.info(f"Migration complete. Old JSON saved as {migrated_file.name}")
+            else:
+                # Just initialize database
+                self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database with schema"""
+        conn = self._get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # Create entries table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS entries (
+                    uuid TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    last_access_time TEXT
+                )
+            """)
+            
+            # Create metadata table (EAV model)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    value_type TEXT NOT NULL,
+                    FOREIGN KEY (uuid) REFERENCES entries(uuid) ON DELETE CASCADE,
+                    UNIQUE(uuid, key)
+                )
+            """)
+            
+            # Create extra_info table (EAV model)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS extra_info (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    value_type TEXT NOT NULL,
+                    FOREIGN KEY (uuid) REFERENCES entries(uuid) ON DELETE CASCADE,
+                    UNIQUE(uuid, key)
+                )
+            """)
+            
+            # Create attachments table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    FOREIGN KEY (uuid) REFERENCES entries(uuid) ON DELETE CASCADE
+                )
+            """)
+            
+            # Create indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_metadata_key ON metadata(key)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_metadata_value ON metadata(value)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_extra_info_uuid ON extra_info(uuid)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_extra_info_key ON extra_info(key)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_attachments_uuid ON attachments(uuid)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_entries_last_access ON entries(last_access_time)")
+            
+            conn.commit()
+            logger.debug("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def _get_db_connection(self) -> sqlite3.Connection:
+        """
+        Get a database connection with WAL mode enabled
+        
+        Returns:
+            sqlite3.Connection: Database connection
+        """
+        conn = sqlite3.connect(str(self.db_file))
+        # Enable WAL mode for better concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    
+    def _encode_value(self, value: Any) -> Tuple[str, str]:
+        """
+        Encode a value to JSON string and determine its type
+        
+        Args:
+            value: Value to encode
+            
+        Returns:
+            Tuple[str, str]: (json_encoded_string, type_name)
+        """
+        if value is None:
+            return ('null', 'null')
+        elif isinstance(value, bool):  # Must check before int
+            return (json.dumps(value), 'bool')
+        elif isinstance(value, int):
+            return (json.dumps(value), 'int')
+        elif isinstance(value, float):
+            return (json.dumps(value), 'float')
+        elif isinstance(value, str):
+            return (json.dumps(value), 'str')
+        elif isinstance(value, list):
+            return (json.dumps(value, ensure_ascii=False), 'list')
+        elif isinstance(value, dict):
+            return (json.dumps(value, ensure_ascii=False), 'dict')
+        else:
+            # Handle Path and other types by converting to string
+            return (json.dumps(str(value)), 'str')
+    
+    def _decode_value(self, json_str: str, type_name: str) -> Any:
+        """
+        Decode a JSON string back to its original type
+        
+        Args:
+            json_str: JSON encoded string
+            type_name: Type name ('str', 'int', 'float', 'bool', 'null', 'list', 'dict')
+            
+        Returns:
+            Decoded value
+        """
+        if type_name == 'null':
+            return None
+        elif type_name == 'bool':
+            return json.loads(json_str)
+        elif type_name == 'int':
+            return json.loads(json_str)
+        elif type_name == 'float':
+            return json.loads(json_str)
+        elif type_name == 'str':
+            return json.loads(json_str)
+        elif type_name == 'list':
+            return json.loads(json_str)
+        elif type_name == 'dict':
+            return json.loads(json_str)
+        else:
+            raise ValueError(f"Unknown type: {type_name}")
+    
+    def _flatten_attachments(self, attachments: Dict[str, Any], prefix: str = "") -> List[Tuple[str, str]]:
+        """
+        Flatten nested attachments dictionary into list of (path, value) tuples
+        
+        Args:
+            attachments: Nested attachments dictionary
+            prefix: Path prefix for recursion
+            
+        Returns:
+            List of (dotted_path, value) tuples
+            
+        Example:
+            {"output": {"videos": "path/to/videos", "images": "path/to/images"}}
+            -> [("output.videos", "path/to/videos"), ("output.images", "path/to/images")]
+        """
+        result = []
+        for key, value in attachments.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                # Recurse into nested dict
+                result.extend(self._flatten_attachments(value, full_key))
+            elif isinstance(value, (str, Path)):
+                # Leaf value - store as string
+                result.append((full_key, str(value)))
+            else:
+                # Other types - convert to string
+                result.append((full_key, str(value)))
+        return result
+    
+    def _unflatten_attachments(self, flat_list: List[Tuple[str, str]]) -> Dict[str, Any]:
+        """
+        Unflatten list of (path, value) tuples back to nested dictionary
+        
+        Args:
+            flat_list: List of (dotted_path, value) tuples
+            
+        Returns:
+            Nested attachments dictionary
+            
+        Example:
+            [("output.videos", "path/to/videos"), ("output.images", "path/to/images")]
+            -> {"output": {"videos": "path/to/videos", "images": "path/to/images"}}
+        """
+        result = {}
+        for path, value in flat_list:
+            keys = path.split('.')
+            current = result
+            for key in keys[:-1]:
+                if key not in current:
+                    current[key] = {}
+                current = current[key]
+            current[keys[-1]] = value
+        return result
+    
+    def _migrate_json_to_sqlite(self):
+        """
+        Migrate data from index.json to SQLite database
+        
+        This method reads the current index_data and inserts all entries
+        into the SQLite database.
+        """
+        if not self.index_data:
+            logger.debug("No data to migrate from JSON to SQLite")
+            return
+        
+        conn = self._get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            for uuid, entry in self.index_data.items():
+                # Insert into entries table
+                created_at = entry.get("extra_info", {}).get("created_at", datetime.now().isoformat())
+                last_access_time = entry.get("extra_info", {}).get("last_access_time")
+                
+                cursor.execute(
+                    "INSERT OR REPLACE INTO entries (uuid, created_at, last_access_time) VALUES (?, ?, ?)",
+                    (uuid, created_at, last_access_time)
+                )
+                
+                # Insert metadata
+                metadata = entry.get("metadata", {})
+                for key, value in metadata.items():
+                    json_value, value_type = self._encode_value(value)
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO metadata (uuid, key, value, value_type) VALUES (?, ?, ?, ?)",
+                        (uuid, key, json_value, value_type)
+                    )
+                
+                # Insert extra_info (excluding last_access_time which is in entries table)
+                extra_info = entry.get("extra_info", {})
+                for key, value in extra_info.items():
+                    if key not in ("created_at", "last_access_time"):
+                        json_value, value_type = self._encode_value(value)
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO extra_info (uuid, key, value, value_type) VALUES (?, ?, ?, ?)",
+                            (uuid, key, json_value, value_type)
+                        )
+                
+                # Insert attachments
+                attachments = entry.get("attachments", {})
+                flat_attachments = self._flatten_attachments(attachments)
+                for path, value in flat_attachments:
+                    cursor.execute(
+                        "INSERT INTO attachments (uuid, path, value) VALUES (?, ?, ?)",
+                        (uuid, path, value)
+                    )
+            
+            conn.commit()
+            logger.info(f"Migrated {len(self.index_data)} entries from JSON to SQLite")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to migrate JSON to SQLite: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def _migrate_sqlite_to_json(self):
+        """
+        Migrate data from SQLite database to index.json format
+        
+        This method reads all data from SQLite and reconstructs the
+        index_data dictionary.
+        """
+        conn = self._get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # Get all entries
+            cursor.execute("SELECT uuid, created_at, last_access_time FROM entries")
+            entries = cursor.fetchall()
+            
+            self.index_data = {}
+            
+            for uuid, created_at, last_access_time in entries:
+                entry = {
+                    "uuid": uuid,
+                    "metadata": {},
+                    "extra_info": {},
+                    "attachments": {}
+                }
+                
+                # Get metadata
+                cursor.execute("SELECT key, value, value_type FROM metadata WHERE uuid = ?", (uuid,))
+                for key, value, value_type in cursor.fetchall():
+                    entry["metadata"][key] = self._decode_value(value, value_type)
+                
+                # Get extra_info
+                cursor.execute("SELECT key, value, value_type FROM extra_info WHERE uuid = ?", (uuid,))
+                for key, value, value_type in cursor.fetchall():
+                    entry["extra_info"][key] = self._decode_value(value, value_type)
+                
+                # Add timestamps from entries table only if they were originally in extra_info
+                # We check if created_at was stored in extra_info table
+                cursor.execute("SELECT key FROM extra_info WHERE uuid = ? AND key = 'created_at'", (uuid,))
+                if cursor.fetchone():
+                    if created_at:
+                        entry["extra_info"]["created_at"] = created_at
+                        
+                if last_access_time:
+                    entry["extra_info"]["last_access_time"] = last_access_time
+                
+                # Get attachments
+                cursor.execute("SELECT path, value FROM attachments WHERE uuid = ?", (uuid,))
+                flat_attachments = cursor.fetchall()
+                if flat_attachments:
+                    entry["attachments"] = self._unflatten_attachments(flat_attachments)
+                
+                self.index_data[uuid] = entry
+            
+            logger.info(f"Migrated {len(self.index_data)} entries from SQLite to JSON")
+        except Exception as e:
+            logger.error(f"Failed to migrate SQLite to JSON: {e}")
+            raise
+        finally:
+            conn.close()
     
     def _acquire_lock(self):
         """Acquire directory lock by creating a lock file (supports nested locking)"""
@@ -155,8 +505,8 @@ class MetadataStorage:
         
         try:
             if hasattr(self, '_lock_handle') and self._lock_handle:
-                # Clean up orphaned files before releasing lock (only on final release)
-                self.cleanup_orphaned_files()
+                # Note: Removed automatic cleanup on lock release to avoid race conditions
+                # Users should call cleanup_orphaned_files() explicitly when needed
                 
                 # First release the lock, then close the file
                 fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
@@ -175,7 +525,7 @@ class MetadataStorage:
             except:
                 pass
     
-    def _load_index(self):
+    def _load_index_json(self):
         """Load index file with fallback to backup if corrupted"""
         # Try loading main index file
         if self.index_file.exists():
@@ -206,7 +556,27 @@ class MetadataStorage:
             logger.debug("Index file does not exist, creating new index")
             self.index_data = {}
     
-    def _save_index(self):
+    def _load_index_sqlite(self):
+        """Load data from SQLite database to memory (for compatibility period)"""
+        # Ensure database is initialized before loading
+        if not self.db_file.exists():
+            logger.debug("Database doesn't exist yet, starting with empty index")
+            self.index_data = {}
+            return
+        self._migrate_sqlite_to_json()
+    
+    def _load_index(self):
+        """
+        Load index data from storage backend
+        
+        Routes to appropriate backend based on use_sqlite flag
+        """
+        if self.use_sqlite:
+            self._load_index_sqlite()
+        else:
+            self._load_index_json()
+    
+    def _save_index_json(self):
         """Save index file atomically with backup"""
         temp_file = self.storage_dir / f".index.json.tmp.{uuid4()}"
         try:
@@ -244,6 +614,99 @@ class MetadataStorage:
                     pass
             logger.error(f"Failed to save index file: {e}")
             raise
+    
+    def _save_index_sqlite(self):
+        """Save data from memory to SQLite database"""
+        # For now, we use a simple approach: clear and reinsert all data
+        # This ensures consistency but could be optimized later
+        conn = self._get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # Get existing UUIDs in database
+            cursor.execute("SELECT uuid FROM entries")
+            db_uuids = {row[0] for row in cursor.fetchall()}
+            
+            # Get UUIDs in memory
+            mem_uuids = set(self.index_data.keys())
+            
+            # Delete entries that are no longer in memory
+            deleted_uuids = db_uuids - mem_uuids
+            for uuid in deleted_uuids:
+                cursor.execute("DELETE FROM entries WHERE uuid = ?", (uuid,))
+            
+            # Insert or update entries that are in memory
+            for uuid, entry in self.index_data.items():
+                # Check if entry exists
+                cursor.execute("SELECT uuid FROM entries WHERE uuid = ?", (uuid,))
+                exists = cursor.fetchone() is not None
+                
+                # Update entries table
+                extra_info = entry.get("extra_info", {})
+                created_at = extra_info.get("created_at", datetime.now().isoformat())
+                last_access_time = extra_info.get("last_access_time")
+                
+                if exists:
+                    cursor.execute(
+                        "UPDATE entries SET last_access_time = ? WHERE uuid = ?",
+                        (last_access_time, uuid)
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO entries (uuid, created_at, last_access_time) VALUES (?, ?, ?)",
+                        (uuid, created_at, last_access_time)
+                    )
+                
+                # Update metadata (delete and reinsert for simplicity)
+                cursor.execute("DELETE FROM metadata WHERE uuid = ?", (uuid,))
+                metadata = entry.get("metadata", {})
+                for key, value in metadata.items():
+                    json_value, value_type = self._encode_value(value)
+                    cursor.execute(
+                        "INSERT INTO metadata (uuid, key, value, value_type) VALUES (?, ?, ?, ?)",
+                        (uuid, key, json_value, value_type)
+                    )
+                
+                # Update extra_info (delete and reinsert)
+                cursor.execute("DELETE FROM extra_info WHERE uuid = ?", (uuid,))
+                extra_info = entry.get("extra_info", {})
+                for key, value in extra_info.items():
+                    if key not in ("created_at", "last_access_time"):
+                        json_value, value_type = self._encode_value(value)
+                        cursor.execute(
+                            "INSERT INTO extra_info (uuid, key, value, value_type) VALUES (?, ?, ?, ?)",
+                            (uuid, key, json_value, value_type)
+                        )
+                
+                # Update attachments (delete and reinsert)
+                cursor.execute("DELETE FROM attachments WHERE uuid = ?", (uuid,))
+                attachments = entry.get("attachments", {})
+                flat_attachments = self._flatten_attachments(attachments)
+                for path, value in flat_attachments:
+                    cursor.execute(
+                        "INSERT INTO attachments (uuid, path, value) VALUES (?, ?, ?)",
+                        (uuid, path, value)
+                    )
+            
+            conn.commit()
+            logger.debug(f"Saved {len(self.index_data)} entries to SQLite")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to save to SQLite: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def _save_index(self):
+        """
+        Save index data to storage backend
+        
+        Routes to appropriate backend based on use_sqlite flag
+        """
+        if self.use_sqlite:
+            self._save_index_sqlite()
+        else:
+            self._save_index_json()
     
     def cleanup_orphaned_files(self, clean_entries: bool = False, clean_unfinished: bool = False):
         """        
@@ -343,7 +806,10 @@ class MetadataStorage:
             excluded_files = {
                 self.index_file.name,
                 self.index_file_backup.name,
-                self.lock_file.name
+                self.lock_file.name,
+                self.db_file.name,  # Exclude SQLite database
+                f"{self.db_file.name}-wal",  # WAL file
+                f"{self.db_file.name}-shm",  # Shared memory file
             }
             storage_files = set()
             for file_path in self.storage_dir.iterdir():
@@ -617,12 +1083,13 @@ class MetadataStorage:
             
             # Match entries where seed doesn't exist or equals 42
             entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
+            
+            # Read all entries (no query parameters)
+            entries, uuids = storage.read_entries()
         """
 
         if not (uuid_query is None or metadata_query is None):
             raise ValueError("Only one of uuid_query or metadata_query can be provided")
-        elif uuid_query is None and metadata_query is None:
-            raise ValueError("One of uuid_query or metadata_query must be provided")
         
         try:
             self._acquire_lock()
