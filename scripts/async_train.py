@@ -224,17 +224,28 @@ class TaskIO:
                                 else:
                                     pool_status = self.query_pool_status(task)
                                     if internal_mtime > 0.0 and internal_mtime != os_mtime:
+                                        # 文件被外部修改，以文件状态为准
                                         if file_status == "waiting" and pool_status != "waiting":
                                             self.task_queue.put_nowait(task)
                                         self.change_pool_status(task, file_status)
                                     else:
-                                        if pool_status is None and file_status != "finished":
-                                            self.change_pool_status(task, "waiting")
-                                            pool_status = "waiting"
-                                            await self.task_queue.put(task)
-                                        
-                                        if pool_status == "waiting" and file_status != "waiting":
-                                            await self.task_queue.put(task)
+                                        # 首次启动或文件未被外部修改
+                                        if pool_status is None:
+                                            # 新任务，需要初始化到pool中
+                                            if file_status == "finished":
+                                                # 已完成任务：加入pool但不加入队列，保持finished状态
+                                                self.change_pool_status(task, "finished")
+                                                pool_status = "finished"
+                                            elif file_status == "terminated":
+                                                # 有问题的任务：改为waiting状态并加入队列，重新尝试
+                                                self.change_pool_status(task, "waiting")
+                                                pool_status = "waiting"
+                                                await self.task_queue.put(task)
+                                            else:
+                                                # waiting或running状态的任务：改为waiting并加入队列
+                                                self.change_pool_status(task, "waiting")
+                                                pool_status = "waiting"
+                                                await self.task_queue.put(task)
 
                                         if pool_status == "finished" and file_status != "finished":
                                             self.file_with_changes.add(file_path)
@@ -278,6 +289,7 @@ class ProcessorWorker:
         self.max_util = max_util
         self.grace_period = grace_period
         self.last_task_time = None
+        self.last_task_end_time = None
         self.task_start_times = dict()
         self.memory = deque(maxlen=60)
         self.util = deque(maxlen=60)
@@ -286,6 +298,10 @@ class ProcessorWorker:
         self.running_proc = dict()
         self.log_readers = dict()  # task -> (stdout_task, stderr_task)
         self.debug = debug
+        self.last_occupied_time = None
+        
+        self.num_cores = os.cpu_count() // 8
+        self.cores = range(self.gpu_id * self.num_cores, (self.gpu_id + 1) * self.num_cores)
 
     async def start(self, task_queue, message_queue, task_pool, task_pool_lock):
         self.task_queue = task_queue
@@ -293,7 +309,7 @@ class ProcessorWorker:
         self.task_pool = task_pool
         self.task_pool_lock = task_pool_lock
         self.schedule_loop = asyncio.create_task(self.schedule())
-        self.status = "idle"
+        # self.status = "idle"
 
     async def stop(self):
         self.schedule_loop.cancel()
@@ -302,27 +318,28 @@ class ProcessorWorker:
     async def read_stream(self, task, stream, stream_name):
         """Async read subprocess output and log it"""
         try:
-            loop = asyncio.get_event_loop()
             while True:
-                line = await loop.run_in_executor(None, stream.readline)
+                line = await stream.readline()
                 if not line:
                     break
                 line_str = line.decode('utf-8', errors='replace').rstrip()
                 if line_str:
+                    bracket_pos = line_str.find('[')
+                    if bracket_pos >= 0:
+                        line_str = line_str[bracket_pos:]
                     history_logger.info(f"[GPU {self.gpu_id}] {line_str}")
         except Exception as e:
             history_logger.debug(f"Error reading {stream_name} for task {task}: {e}")
-        finally:
-            try:
-                stream.close()
-            except:
-                pass
 
     async def generate_status_info(self):
         try:
             async with self.status_lock:
                 columns, rows = os.get_terminal_size()
-                info = f"GPU {self.gpu_id} - Mem: {max(self.memory):.2f}%, Util: {sum(self.util)/len(self.util):.2f}%, Status: {self.status}\n"
+
+                elapsed_occupied_time = time.time() - self.last_occupied_time if (self.status == "occupied" and self.last_occupied_time is not None) else None
+                occupied_str = f", waited {elapsed_occupied_time:.0f}s" if elapsed_occupied_time is not None else ""
+
+                info = f"GPU {self.gpu_id} - Mem: {max(self.memory) if self.memory else 0.0:.2f}%, Util: {sum(self.util)/len(self.util) if self.util else 0.0:.2f}%, Status: {self.status}{occupied_str}\n"
                 for task, proc in self.running_proc.items():
                     timestr = time.strftime(' %H:%M:%S', time.gmtime(time.time() - self.task_start_times[task]))
                     taskstr = f"      - {task}"
@@ -358,23 +375,28 @@ class ProcessorWorker:
                     async with self.status_lock:
                         self.memory.append(memory_pct)
                         self.util.append(util_pct)
-                        max_memory_pct = max(self.memory)
-                        avg_util_pct = sum(self.util)/len(self.util)
+                        max_memory_pct = max(self.memory) if self.memory else 0.0
+                        avg_util_pct = sum(self.util)/len(self.util) if self.util else 0.0
                         self.last_task_time = max(self.task_start_times.values()) if self.task_start_times else None
                     
                         system_memory_pct = get_system_memory_usage()
                         
                         async with gpus_lock:
                             self_available = self.gpu_id in available_gpus
-                            
-                        if self_available \
+                        
+                        # 判断是否为外部占用：没有自己的进程，但有使用率，且不是刚结束任务（避免误判）
+                        time_since_last_end = (time.time() - self.last_task_end_time) if self.last_task_end_time else float('inf')
+                        if (self.last_task_time is None) and (not self.running_proc) and (avg_util_pct > 10 or max_memory_pct > 10) and time_since_last_end > 30:
+                            if self.status != "occupied":  # 只在第一次进入occupied状态时设置时间
+                                self.status = "occupied"
+                                self.last_occupied_time = time.time()
+                        elif self_available \
                             and max_memory_pct < self.max_memory \
                             and avg_util_pct < self.max_util \
-                            and system_memory_pct < 60.0 \
-                            and (self.last_task_time is None or time.time() - self.last_task_time > self.grace_period):
+                            and system_memory_pct < 80.0 \
+                            and (self.last_task_time is None or time.time() - self.last_task_time > self.grace_period) \
+                            and (self.last_occupied_time is None or time.time() - self.last_occupied_time > 15):
                             self.status = "idle"
-                        elif self_available and self.last_task_time is None:
-                            self.status = "occupied"
                             
                         if self.status == "idle":
                             try:
@@ -382,11 +404,16 @@ class ProcessorWorker:
                                 async with self.task_pool_lock:
                                     if task in self.task_pool["waiting"]:
                                         try:
-                                            proc = subprocess.Popen(
-                                                f"CUDA_VISIBLE_DEVICES={self.gpu_id} {task}{' --debug' if self.debug else ''}", 
-                                                shell=True, 
-                                                stdout=subprocess.PIPE, 
-                                                stderr=subprocess.PIPE
+                                            env = os.environ.copy()
+                                            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+                                            env["OMP_NUM_THREADS"] = "4"
+                                            env["MKL_NUM_THREADS"] = "4"
+                                            
+                                            proc = await asyncio.create_subprocess_shell(
+                                                f"taskset -c {self.cores[0]}-{self.cores[-1]} {task}", 
+                                                stdout=asyncio.subprocess.PIPE, 
+                                                stderr=asyncio.subprocess.PIPE,
+                                                env=env
                                             )
                                             self.running_proc[task] = proc
                                             self.task_start_times[task] = time.time()
@@ -410,7 +437,7 @@ class ProcessorWorker:
 
                         for task, proc in running_proc_copy.items():
                             try:
-                                proc_status = proc.poll()
+                                proc_status = proc.returncode
                                 if proc_status is not None:
                                     tasks_to_remove.append(task)
                                     if proc_status == 0:
@@ -444,13 +471,20 @@ class ProcessorWorker:
                             except Exception as e:
                                 history_logger.error(f"Error checking task status on GPU {self.gpu_id}: {task}, error: {e}")
                             
-                            for task in tasks_to_remove:
-                                self.running_proc.pop(task, None)
-                                # Cancel and cleanup log reader tasks
-                                if task in self.log_readers:
-                                    stdout_task, stderr_task = self.log_readers.pop(task)
-                                    stdout_task.cancel()
-                                    stderr_task.cancel()
+                        for task in tasks_to_remove:
+                            self.running_proc.pop(task, None)
+                            # Cancel and cleanup log reader tasks
+                            if task in self.log_readers:
+                                stdout_task, stderr_task = self.log_readers.pop(task)
+                                stdout_task.cancel()
+                                stderr_task.cancel()
+                        
+                        if tasks_to_remove:
+                            self.last_task_end_time = time.time()
+                            
+                        if not self.running_proc:
+                            self.memory.clear()
+                            self.util.clear()
 
                 except asyncio.CancelledError:
                     raise
