@@ -8,8 +8,44 @@ from typing import Dict, List, Any, Optional, Union, Tuple
 import logging
 import random
 from uuid import uuid4
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+__all__ = ["MetadataStorage", "In"]
+
+
+class In:
+    """
+    Wrapper class for multi-value matching in metadata queries.
+    
+    Matches if the entry's field value is in the provided list of values.
+    Special handling for None: if None is in values, also matches entries where the field doesn't exist.
+    
+    Example:
+        # Match entries where seed is 0, 1, 2, or 3
+        metadata_query = {"seed": In(0, 1, 2, 3)}
+        
+        # Match entries where seed doesn't exist (None) or equals 42
+        metadata_query = {"seed": In(None, 42)}
+    """
+    
+    def __init__(self, *values):
+        """
+        Initialize In wrapper with values to match against.
+        
+        Args:
+            *values: Variable number of values to match. Can include None to match missing fields.
+        """
+        self.values = values
+    
+    def __repr__(self):
+        return f"In({', '.join(repr(v) for v in self.values)})"
+    
+    def __eq__(self, other):
+        """Check if other value is in the values list"""
+        return other in self.values
 
 class MetadataStorage:
     """
@@ -18,8 +54,24 @@ class MetadataStorage:
     Features:
     1. Create UUID-named files when storing files and record metadata in index
     2. Query matching files based on metadata
-    3. Support partial metadata matching queries
+    3. Support partial metadata matching queries with In wrapper for multi-value matching
     4. Directory-level locking to prevent concurrent access
+    5. Automatic tracking of last access time for each entry
+    
+    Multi-value matching:
+        Use the In wrapper to match entries where a field value is in a list of values:
+        
+        Example:
+            # Match entries where seed is 0, 1, 2, or 3
+            entries, uuids = storage.read_entries(metadata_query={"seed": In(0, 1, 2, 3)})
+            
+            # Match entries where seed doesn't exist (None) or equals 42
+            entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
+    
+    Access time tracking:
+        The system automatically records the last access time in extra_info["last_access_time"]
+        when entries are read via read_entries() or get_entry(). The timestamp is in ISO format.
+        This enables future cleanup based on access patterns.
     """
     
     def __init__(self, storage_dir: str = "storage"):
@@ -526,17 +578,45 @@ class MetadataStorage:
 
         return matched_entires, matched_uuids
     
+    def _update_access_time(self, uuids: List[str]):
+        """
+        Update last access time for given entries
+        
+        Args:
+            uuids: List of UUIDs to update access time for
+        """
+        current_time = datetime.now().isoformat()
+        for uuid in uuids:
+            if uuid in self.index_data:
+                if "extra_info" not in self.index_data[uuid]:
+                    self.index_data[uuid]["extra_info"] = {}
+                self.index_data[uuid]["extra_info"]["last_access_time"] = current_time
+        
+        # Save index after updating access times
+        self._save_index()
+    
     def read_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
         """
         Read entries and their UUIDs based on UUID or metadata query
         
         Args:
             uuid_query: UUID query conditions
-            metadata_query: Metadata query conditions
-            exact_match: Whether to require exact match, False for partial match
+            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching.
+            exact_match: Whether to require exact match, False for partial match.
+                        Note: In wrapper is only supported when exact_match=False.
             
         Returns:
             Tuple[List[Dict[str, Any]], List[str]]: Tuple of matching entries and their UUIDs
+            
+        Side effects:
+            Updates extra_info["last_access_time"] for all matched entries with current timestamp
+            
+        Examples:
+            # Match entries where seed is 0, 1, 2, or 3
+            entries, uuids = storage.read_entries(metadata_query={"seed": In(0, 1, 2, 3)})
+            
+            # Match entries where seed doesn't exist or equals 42
+            entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
         """
 
         if not (uuid_query is None or metadata_query is None):
@@ -548,6 +628,10 @@ class MetadataStorage:
             self._acquire_lock()
             
             matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
+
+            # Update last access time for matched entries
+            if matched_uuids:
+                self._update_access_time(matched_uuids)
 
             logger.debug(f"Found {len(matched_entries)} matching entries for query: {uuid_query if uuid_query is not None else metadata_query}")
             return matched_entries, matched_uuids
@@ -560,11 +644,18 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID query conditions
-            metadata_query: Metadata query conditions
-            exact_match: Whether to require exact match, False for partial match
+            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching.
+            exact_match: Whether to require exact match, False for partial match.
+                        Note: In wrapper is only supported when exact_match=False.
             
         Returns:
             Dict[str, Any]: Entry data
+            
+        Side effects:
+            Updates extra_info["last_access_time"] for the matched entry with current timestamp
+            
+        Raises:
+            ValueError: If number of matching entries is not exactly 1
         """
         if not (uuid_query is None or metadata_query is None):
             raise ValueError("Only one of uuid_query or metadata_query can be provided")
@@ -577,6 +668,10 @@ class MetadataStorage:
 
             if len(matched_entries) != 1:
                 raise ValueError(f"{len(matched_entries)} entries found for query: {uuid_query if uuid_query is not None else metadata_query}")
+            
+            # Update last access time for the matched entry
+            self._update_access_time(matched_uuids)
+            
             return matched_entries[0]
         except Exception as e:
             raise ValueError(f"Failed to get entry: {e}")
@@ -584,7 +679,33 @@ class MetadataStorage:
             self._release_lock()
     
     def _exact_metadata_match(self, file_metadata: Dict[str, Any], query_metadata: Dict[str, Any]) -> bool:
-        """Check if metadata matches exactly"""
+        """
+        Check if metadata matches exactly
+        
+        Args:
+            file_metadata: Metadata of the file entry
+            query_metadata: Metadata query conditions for exact match
+            
+        Returns:
+            bool: True if metadata matches exactly, False otherwise
+            
+        Note:
+            In wrapper is not supported in exact match mode and will be treated as not matching.
+        """
+        # Check if query contains In wrapper (not supported in exact match)
+        def contains_in_wrapper(obj: Any) -> bool:
+            if isinstance(obj, In):
+                return True
+            elif isinstance(obj, dict):
+                return any(contains_in_wrapper(v) for v in obj.values())
+            elif isinstance(obj, (list, tuple)):
+                return any(contains_in_wrapper(item) for item in obj)
+            return False
+        
+        if contains_in_wrapper(query_metadata):
+            logger.warning("In wrapper detected in exact_match mode, this will not match")
+            return False
+            
         return file_metadata == query_metadata
     
     def _partial_metadata_match(self, entry_metadata: Dict[str, Any], query_metadata: Dict[str, Any]) -> bool:
@@ -599,7 +720,14 @@ class MetadataStorage:
             bool: True if metadata matches partially, False otherwise
         """
         def match(this: Any, query: Any) -> bool:
-            if isinstance(query, dict):
+            # Handle In wrapper for multi-value matching
+            if isinstance(query, In):
+                # If None is in values and field doesn't exist (this is None), it's a match
+                if None in query.values and this is None:
+                    return True
+                # Otherwise check if value is in the list
+                return this in query.values
+            elif isinstance(query, dict):
                 return isinstance(this, dict) and all(match(this.get(key, None), value) for key, value in query.items())
             elif isinstance(query, list):
                 return isinstance(this, list) and this == query
@@ -618,8 +746,9 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID query conditions
-            metadata_query: Metadata query conditions
-            exact_match: Whether to require exact match, False for partial match
+            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching.
+            exact_match: Whether to require exact match, False for partial match.
+                        Note: In wrapper is only supported when exact_match=False.
             
         Returns:
             int: Number of files deleted
@@ -674,6 +803,69 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
+    def compare_metadata(self, uuid1: str, uuid2: str) -> Dict[str, Any]:
+        """
+        Compare metadata between two entries and return only the differences
+        
+        Args:
+            uuid1: UUID of first entry
+            uuid2: UUID of second entry
+            
+        Returns:
+            Dict[str, Any]: Dictionary containing only different metadata items
+                           Format: {key: {"entry1": value1, "entry2": value2}}
+                           For nested dicts, uses dot notation like "parent.child"
+        """
+        try:
+            self._acquire_lock()
+            
+            # Get both entries
+            entry1 = self.get_entry(uuid_query=uuid1)
+            entry2 = self.get_entry(uuid_query=uuid2)
+            
+            metadata1 = entry1.get("metadata", {})
+            metadata2 = entry2.get("metadata", {})
+            
+            def compare_recursive(obj1: Any, obj2: Any, path: str = "") -> Dict[str, Any]:
+                """Recursively compare two objects and return differences"""
+                differences = {}
+                
+                # If both are dicts, recurse into them
+                if isinstance(obj1, dict) and isinstance(obj2, dict):
+                    all_keys = set(obj1.keys()) | set(obj2.keys())
+                    for key in all_keys:
+                        new_path = f"{path}.{key}" if path else key
+                        val1 = obj1.get(key)
+                        val2 = obj2.get(key)
+                        
+                        # Recursively compare if both values exist
+                        if key in obj1 and key in obj2:
+                            sub_diff = compare_recursive(val1, val2, new_path)
+                            differences.update(sub_diff)
+                        else:
+                            # Key exists in only one dict
+                            differences[new_path] = {
+                                "entry1": val1 if key in obj1 else None,
+                                "entry2": val2 if key in obj2 else None
+                            }
+                # If both are lists, compare them
+                elif isinstance(obj1, list) and isinstance(obj2, list):
+                    if obj1 != obj2:
+                        differences[path] = {"entry1": obj1, "entry2": obj2}
+                # For all other types (including when types differ), direct comparison
+                else:
+                    if obj1 != obj2:
+                        differences[path] = {"entry1": obj1, "entry2": obj2}
+                
+                return differences
+            
+            result = compare_recursive(metadata1, metadata2)
+            logger.debug(f"Found {len(result)} differences between {uuid1} and {uuid2}")
+            return result
+            
+        finally:
+            self._release_lock()
+    
     def get_storage_stats(self):
         """
         Print storage statistics
@@ -696,7 +888,12 @@ class MetadataStorage:
             self._release_lock()
 
     def __del__(self):
-        """Destructor to ensure lock is released"""
+        """
+        Destructor to ensure lock is released when object is garbage collected
+        
+        Attempts to release any held locks to prevent resource leaks.
+        Errors are silently ignored during cleanup to avoid issues in object destruction.
+        """
         try:
             if hasattr(self, '_lock_handle') and self._lock_handle:
                 self._release_lock()
