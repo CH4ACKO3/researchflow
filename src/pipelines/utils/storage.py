@@ -1015,6 +1015,17 @@ class MetadataStorage:
             self._release_lock()
     
     def _traverse_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """
+        Internal method to traverse and match entries based on UUID or metadata queries (legacy JSON backend)
+        
+        Args:
+            uuid_query: UUID or list of UUIDs to match
+            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching)
+            exact_match: If True, requires exact metadata match; if False, allows partial match
+            
+        Returns:
+            Tuple of (matched entries list, matched UUIDs list)
+        """
         if uuid_query is None and metadata_query is None:
             return list(self.index_data.values()), list(self.index_data.keys())
         
@@ -1270,65 +1281,76 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def compare_metadata(self, uuid1: str, uuid2: str) -> Dict[str, Any]:
+    def analyze_metadata_fields(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[str], Dict[str, List[Any]]]:
         """
-        Compare metadata between two entries and return only the differences
+        Analyze metadata fields across queried entries to identify consistent and inconsistent fields
         
         Args:
-            uuid1: UUID of first entry
-            uuid2: UUID of second entry
+            uuid_query: UUID or list of UUIDs to query
+            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching)
+            exact_match: If True, requires exact metadata match; if False, allows partial match
             
         Returns:
-            Dict[str, Any]: Dictionary containing only different metadata items
-                           Format: {key: {"entry1": value1, "entry2": value2}}
-                           For nested dicts, uses dot notation like "parent.child"
+            Tuple of:
+            - consistent_fields: List of field names that have the same value across all entries
+            - inconsistent_fields: Dict mapping field names to list of all possible values (including None)
+                                   Format: {"seed": [None, 0, 1, 42], "model": ["resnet", "vgg"], ...}
         """
         try:
             self._acquire_lock()
             
-            # Get both entries
-            entry1 = self.get_entry(uuid_query=uuid1)
-            entry2 = self.get_entry(uuid_query=uuid2)
+            # Query entries using the same parameters as read_entries
+            entries, uuids = self.read_entries(uuid_query=uuid_query, metadata_query=metadata_query, exact_match=exact_match)
             
-            metadata1 = entry1.get("metadata", {})
-            metadata2 = entry2.get("metadata", {})
+            if not entries:
+                logger.debug("No entries found for analysis")
+                return [], {}
             
-            def compare_recursive(obj1: Any, obj2: Any, path: str = "") -> Dict[str, Any]:
-                """Recursively compare two objects and return differences"""
-                differences = {}
+            # Collect all field names across all entries
+            all_fields = set()
+            for entry in entries:
+                metadata = entry.get("metadata", {})
+                all_fields.update(metadata.keys())
+            
+            # Analyze each field
+            consistent_fields = []
+            inconsistent_fields = {}
+            
+            for field in all_fields:
+                # Collect all values for this field (None if field doesn't exist in an entry)
+                values = []
+                for entry in entries:
+                    metadata = entry.get("metadata", {})
+                    value = metadata.get(field)
+                    values.append(value)
                 
-                # If both are dicts, recurse into them
-                if isinstance(obj1, dict) and isinstance(obj2, dict):
-                    all_keys = set(obj1.keys()) | set(obj2.keys())
-                    for key in all_keys:
-                        new_path = f"{path}.{key}" if path else key
-                        val1 = obj1.get(key)
-                        val2 = obj2.get(key)
-                        
-                        # Recursively compare if both values exist
-                        if key in obj1 and key in obj2:
-                            sub_diff = compare_recursive(val1, val2, new_path)
-                            differences.update(sub_diff)
-                        else:
-                            # Key exists in only one dict
-                            differences[new_path] = {
-                                "entry1": val1 if key in obj1 else None,
-                                "entry2": val2 if key in obj2 else None
-                            }
-                # If both are lists, compare them
-                elif isinstance(obj1, list) and isinstance(obj2, list):
-                    if obj1 != obj2:
-                        differences[path] = {"entry1": obj1, "entry2": obj2}
-                # For all other types (including when types differ), direct comparison
+                # Get unique values
+                unique_values = []
+                for val in values:
+                    # Check if value already in unique_values (handle unhashable types)
+                    try:
+                        if val not in unique_values:
+                            unique_values.append(val)
+                    except TypeError:
+                        # For unhashable types like lists/dicts, do manual comparison
+                        found = False
+                        for existing_val in unique_values:
+                            if val == existing_val:
+                                found = True
+                                break
+                        if not found:
+                            unique_values.append(val)
+                
+                # Determine if field is consistent or inconsistent
+                if len(unique_values) == 1:
+                    # All entries have the same value for this field
+                    consistent_fields.append(field)
                 else:
-                    if obj1 != obj2:
-                        differences[path] = {"entry1": obj1, "entry2": obj2}
-                
-                return differences
+                    # Field has different values across entries
+                    inconsistent_fields[field] = unique_values
             
-            result = compare_recursive(metadata1, metadata2)
-            logger.debug(f"Found {len(result)} differences between {uuid1} and {uuid2}")
-            return result
+            logger.debug(f"Analyzed {len(entries)} entries: {len(consistent_fields)} consistent fields, {len(inconsistent_fields)} inconsistent fields")
+            return consistent_fields, inconsistent_fields
             
         finally:
             self._release_lock()
