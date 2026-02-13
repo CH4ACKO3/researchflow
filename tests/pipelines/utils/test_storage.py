@@ -7,7 +7,7 @@ import pytest
 from pathlib import Path
 from typing import Dict, Any
 import threading
-from pipelines.utils.storage import MetadataStorage
+from pipelines.utils.storage import MetadataStorage, In, Have
 
 
 class TestMetadataStorage:
@@ -483,6 +483,140 @@ class TestMetadataStorage:
         entries, uuids = storage.read_entries(metadata_query={"type": "train"})
         assert len(entries) == 1
         assert uuids[0] == uuid2
+    
+    def test_in_wrapper_basic(self, storage):
+        """Test In wrapper for multi-value matching"""
+        # Create test entries
+        storage.create_entry(metadata={"seed": 0, "name": "entry1"})
+        storage.create_entry(metadata={"seed": 1, "name": "entry2"})
+        storage.create_entry(metadata={"seed": 2, "name": "entry3"})
+        storage.create_entry(metadata={"seed": 5, "name": "entry4"})
+        
+        # Test matching multiple values
+        entries, uuids = storage.read_entries(metadata_query={"seed": In(0, 1, 2, 3)})
+        assert len(entries) == 3
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry2", "entry3"}
+    
+    def test_in_wrapper_with_none(self, storage):
+        """Test In wrapper with None to match missing fields"""
+        # Create test entries
+        storage.create_entry(metadata={"seed": 42, "name": "entry1"})
+        storage.create_entry(metadata={"name": "entry2"})  # No seed field
+        storage.create_entry(metadata={"seed": 0, "name": "entry3"})
+        
+        # Match entries where seed doesn't exist (None) or equals 42
+        entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
+        assert len(entries) == 2
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry2"}
+    
+    def test_in_wrapper_single_value(self, storage):
+        """Test In wrapper with single value"""
+        storage.create_entry(metadata={"type": "A", "name": "entry1"})
+        storage.create_entry(metadata={"type": "B", "name": "entry2"})
+        
+        entries, uuids = storage.read_entries(metadata_query={"type": In("A")})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
+    
+    def test_in_wrapper_no_match(self, storage):
+        """Test In wrapper with no matching values"""
+        storage.create_entry(metadata={"seed": 0})
+        storage.create_entry(metadata={"seed": 1})
+        
+        entries, uuids = storage.read_entries(metadata_query={"seed": In(5, 6, 7)})
+        assert len(entries) == 0
+    
+    def test_in_wrapper_combined_with_other_conditions(self, storage):
+        """Test In wrapper combined with other metadata conditions"""
+        storage.create_entry(metadata={"seed": 0, "type": "train", "name": "entry1"})
+        storage.create_entry(metadata={"seed": 1, "type": "train", "name": "entry2"})
+        storage.create_entry(metadata={"seed": 0, "type": "eval", "name": "entry3"})
+        
+        entries, uuids = storage.read_entries(metadata_query={"seed": In(0, 1), "type": "train"})
+        assert len(entries) == 2
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry2"}
+    
+    def test_have_wrapper_basic(self, storage):
+        """Test Have wrapper for list element matching"""
+        # Create test entries with list metadata
+        storage.create_entry(metadata={"tags": ["tag1", "tag2", "tag3"], "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag2", "tag4"], "name": "entry2"})
+        storage.create_entry(metadata={"tags": ["tag5", "tag6"], "name": "entry3"})
+        storage.create_entry(metadata={"name": "entry4"})  # No tags field
+        
+        # Match entries with "tag1" in tags list
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1")})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
+        
+        # Match entries with "tag2" in tags list (should match entry1 and entry2)
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag2")})
+        assert len(entries) == 2
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry2"}
+    
+    def test_have_wrapper_multiple_values(self, storage):
+        """Test Have wrapper with multiple values (OR logic)"""
+        storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag3", "tag4"], "name": "entry2"})
+        storage.create_entry(metadata={"tags": ["tag5"], "name": "entry3"})
+        
+        # Match entries where tags list contains "tag1" OR "tag5"
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1", "tag5")})
+        assert len(entries) == 2
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry3"}
+    
+    def test_have_wrapper_no_match(self, storage):
+        """Test Have wrapper with no matching values"""
+        storage.create_entry(metadata={"tags": ["tag1", "tag2"]})
+        storage.create_entry(metadata={"tags": ["tag3", "tag4"]})
+        
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("nonexistent")})
+        assert len(entries) == 0
+    
+    def test_have_wrapper_non_list_field(self, storage):
+        """Test Have wrapper should not match non-list fields"""
+        storage.create_entry(metadata={"name": "entry1"})
+        storage.create_entry(metadata={"name": "entry2"})
+        
+        # Have should not match string fields
+        entries, uuids = storage.read_entries(metadata_query={"name": Have("entry1")})
+        assert len(entries) == 0
+    
+    def test_have_wrapper_combined_with_other_conditions(self, storage):
+        """Test Have wrapper combined with other metadata conditions"""
+        storage.create_entry(metadata={"tags": ["tag1", "tag2"], "type": "train", "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag2", "tag3"], "type": "train", "name": "entry2"})
+        storage.create_entry(metadata={"tags": ["tag1", "tag3"], "type": "eval", "name": "entry3"})
+        
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1"), "type": "train"})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
+    
+    def test_have_wrapper_empty_list(self, storage):
+        """Test Have wrapper with empty list field"""
+        storage.create_entry(metadata={"tags": [], "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag1"], "name": "entry2"})
+        
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1")})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry2"
+    
+    def test_in_and_have_combined(self, storage):
+        """Test combining In and Have wrappers in same query"""
+        storage.create_entry(metadata={"tags": ["tag1", "tag2"], "seed": 0, "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag2", "tag3"], "seed": 1, "name": "entry2"})
+        storage.create_entry(metadata={"tags": ["tag1", "tag3"], "seed": 2, "name": "entry3"})
+        storage.create_entry(metadata={"tags": ["tag4"], "seed": 0, "name": "entry4"})
+        
+        # Match entries where tags contains "tag1" AND seed is 0 or 1
+        entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1"), "seed": In(0, 1)})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-__all__ = ["MetadataStorage", "In"]
+__all__ = ["MetadataStorage", "In", "Have"]
 
 
 class In:
@@ -48,6 +48,33 @@ class In:
         """Check if other value is in the values list"""
         return other in self.values
 
+
+class Have:
+    """
+    Wrapper class for list element matching in metadata queries.
+    
+    Matches if the entry's field value is a list containing at least one of the provided values.
+    
+    Example:
+        # Match entries where tags list contains "tag1"
+        metadata_query = {"tags": Have("tag1")}
+        
+        # Match entries where tags list contains "tag1" or "tag2"
+        metadata_query = {"tags": Have("tag1", "tag2")}
+    """
+    
+    def __init__(self, *values):
+        """
+        Initialize Have wrapper with values to match against.
+        
+        Args:
+            *values: Variable number of values to check for in the list.
+        """
+        self.values = values
+    
+    def __repr__(self):
+        return f"Have({', '.join(repr(v) for v in self.values)})"
+
 class MetadataStorage:
     """
     SQLite-based indexed file storage system with directory-level locking
@@ -74,6 +101,16 @@ class MetadataStorage:
             
             # Match entries where seed doesn't exist (None) or equals 42
             entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
+    
+    List element matching:
+        Use the Have wrapper to match entries where a field's list value contains at least one of the specified elements:
+        
+        Example:
+            # Match entries where tags list contains "tag1"
+            entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1")})
+            
+            # Match entries where tags list contains "tag1" or "tag2"
+            entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1", "tag2")})
     
     Access time tracking:
         The system automatically records the last access time in extra_info["last_access_time"]
@@ -1020,7 +1057,7 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID or list of UUIDs to match
-            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching)
+            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching and Have wrapper for list element matching)
             exact_match: If True, requires exact metadata match; if False, allows partial match
             
         Returns:
@@ -1095,6 +1132,9 @@ class MetadataStorage:
             # Match entries where seed doesn't exist or equals 42
             entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
             
+            # Match entries where tags list contains "tag1"
+            entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1")})
+            
             # Read all entries (no query parameters)
             entries, uuids = storage.read_entries()
         """
@@ -1122,9 +1162,9 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID query conditions
-            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching.
+            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching and Have wrapper for list element matching.
             exact_match: Whether to require exact match, False for partial match.
-                        Note: In wrapper is only supported when exact_match=False.
+                        Note: In and Have wrappers are only supported when exact_match=False.
             
         Returns:
             Dict[str, Any]: Entry data
@@ -1168,20 +1208,20 @@ class MetadataStorage:
             bool: True if metadata matches exactly, False otherwise
             
         Note:
-            In wrapper is not supported in exact match mode and will be treated as not matching.
+            In and Have wrappers are not supported in exact match mode and will be treated as not matching.
         """
-        # Check if query contains In wrapper (not supported in exact match)
-        def contains_in_wrapper(obj: Any) -> bool:
-            if isinstance(obj, In):
+        # Check if query contains In or Have wrapper (not supported in exact match)
+        def contains_wrapper(obj: Any) -> bool:
+            if isinstance(obj, (In, Have)):
                 return True
             elif isinstance(obj, dict):
-                return any(contains_in_wrapper(v) for v in obj.values())
+                return any(contains_wrapper(v) for v in obj.values())
             elif isinstance(obj, (list, tuple)):
-                return any(contains_in_wrapper(item) for item in obj)
+                return any(contains_wrapper(item) for item in obj)
             return False
         
-        if contains_in_wrapper(query_metadata):
-            logger.warning("In wrapper detected in exact_match mode, this will not match")
+        if contains_wrapper(query_metadata):
+            logger.warning("In or Have wrapper detected in exact_match mode, this will not match")
             return False
             
         return file_metadata == query_metadata
@@ -1205,6 +1245,12 @@ class MetadataStorage:
                     return True
                 # Otherwise check if value is in the list
                 return this in query.values
+            # Handle Have wrapper for list element matching
+            elif isinstance(query, Have):
+                # Check if this is a list and contains at least one of the query values
+                if not isinstance(this, list):
+                    return False
+                return any(item in this for item in query.values)
             elif isinstance(query, dict):
                 return isinstance(this, dict) and all(match(this.get(key, None), value) for key, value in query.items())
             elif isinstance(query, list):
@@ -1224,9 +1270,9 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID query conditions
-            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching.
+            metadata_query: Metadata query conditions. Supports In wrapper for multi-value matching and Have wrapper for list element matching.
             exact_match: Whether to require exact match, False for partial match.
-                        Note: In wrapper is only supported when exact_match=False.
+                        Note: In and Have wrappers are only supported when exact_match=False.
             
         Returns:
             int: Number of files deleted
@@ -1287,7 +1333,7 @@ class MetadataStorage:
         
         Args:
             uuid_query: UUID or list of UUIDs to query
-            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching)
+            metadata_query: Metadata conditions to match (supports In wrapper for multi-value matching and Have wrapper for list element matching)
             exact_match: If True, requires exact metadata match; if False, allows partial match
             
         Returns:
