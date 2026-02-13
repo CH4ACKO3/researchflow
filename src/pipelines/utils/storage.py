@@ -54,6 +54,7 @@ class Have:
     Wrapper class for list element matching in metadata queries.
     
     Matches if the entry's field value is a list containing at least one of the provided values.
+    For robustness, also matches string fields that equal one of the provided values.
     
     Example:
         # Match entries where tags list contains "tag1"
@@ -61,6 +62,9 @@ class Have:
         
         # Match entries where tags list contains "tag1" or "tag2"
         metadata_query = {"tags": Have("tag1", "tag2")}
+        
+        # Also works with string fields (robustness feature)
+        metadata_query = {"category": Have("value1", "value2")}
     """
     
     def __init__(self, *values):
@@ -1051,6 +1055,84 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
+    def append_to_metadata_list(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, key: str = None, values: Union[Any, List[Any]] = None, allow_multiple: bool = False, create_if_missing: bool = True):
+        """
+        Append values to a list field in entry metadata
+        
+        Args:
+            uuid_query: UUID or list of UUIDs to match
+            metadata_query: Metadata conditions to match
+            key: Metadata key to append to (must be a list or will be created as list)
+            values: Single value or list of values to append
+            allow_multiple: If True, allow updating multiple entries
+            create_if_missing: If True, create the list field if it doesn't exist; if False, raise error
+        
+        Examples:
+            # Append single tag to an entry
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag_x")
+            
+            # Append multiple tags to an entry
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag_x", "tag_y"])
+            
+            # Append tag to all entries matching metadata query
+            storage.append_to_metadata_list(metadata_query={"type": "train"}, key="tags", values="processed", allow_multiple=True)
+        """
+        if key is None:
+            raise ValueError("key parameter is required")
+        if values is None:
+            raise ValueError("values parameter is required")
+        
+        # Normalize values to list
+        if not isinstance(values, list):
+            values = [values]
+        
+        try:
+            self._acquire_lock()
+            
+            # Find matching entries
+            if uuid_query is None and metadata_query is None:
+                raise ValueError("Either uuid_query or metadata_query must be provided")
+            
+            if uuid_query is not None:
+                matched_entries, matched_uuids = self._traverse_entries(uuid_query=uuid_query)
+            else:
+                matched_entries, matched_uuids = self._traverse_entries(metadata_query=metadata_query)
+            
+            if len(matched_entries) == 0:
+                raise ValueError(f"No entries found for query")
+            
+            if len(matched_entries) > 1 and not allow_multiple:
+                raise ValueError(f"Multiple entries found ({len(matched_entries)}), but allow_multiple is False")
+            
+            # Append values to each matched entry
+            for matched_entry in matched_entries:
+                metadata = matched_entry["metadata"]
+                
+                if key not in metadata:
+                    if create_if_missing:
+                        # Create new list field
+                        metadata[key] = []
+                        logger.debug(f"Created new list field '{key}' in metadata")
+                    else:
+                        raise ValueError(f"Metadata key '{key}' does not exist and create_if_missing is False")
+                
+                # Check if existing value is a list
+                if not isinstance(metadata[key], list):
+                    raise ValueError(f"Metadata key '{key}' exists but is not a list (type: {type(metadata[key]).__name__})")
+                
+                # Append values (avoid duplicates)
+                for value in values:
+                    if value not in metadata[key]:
+                        metadata[key].append(value)
+                        logger.debug(f"Appended '{value}' to metadata['{key}']")
+                    else:
+                        logger.debug(f"Value '{value}' already exists in metadata['{key}'], skipped")
+            
+            self._save_index()
+            logger.debug(f"Appended values to metadata key '{key}' for {len(matched_entries)} entries")
+        finally:
+            self._release_lock()
+    
     def _traverse_entries(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
         """
         Internal method to traverse and match entries based on UUID or metadata queries (legacy JSON backend)
@@ -1247,10 +1329,15 @@ class MetadataStorage:
                 return this in query.values
             # Handle Have wrapper for list element matching
             elif isinstance(query, Have):
-                # Check if this is a list and contains at least one of the query values
-                if not isinstance(this, list):
+                # Support both list and single string values for robustness
+                if isinstance(this, list):
+                    # Standard case: field is a list
+                    return any(item in this for item in query.values)
+                elif isinstance(this, str):
+                    # Robustness: if field is a single string, check if it matches any query value
+                    return this in query.values
+                else:
                     return False
-                return any(item in this for item in query.values)
             elif isinstance(query, dict):
                 return isinstance(this, dict) and all(match(this.get(key, None), value) for key, value in query.items())
             elif isinstance(query, list):

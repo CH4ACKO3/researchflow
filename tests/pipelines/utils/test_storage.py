@@ -579,12 +579,18 @@ class TestMetadataStorage:
         assert len(entries) == 0
     
     def test_have_wrapper_non_list_field(self, storage):
-        """Test Have wrapper should not match non-list fields"""
+        """Test Have wrapper robustness with non-list fields"""
         storage.create_entry(metadata={"name": "entry1"})
         storage.create_entry(metadata={"name": "entry2"})
+        storage.create_entry(metadata={"count": 42})
         
-        # Have should not match string fields
+        # Have now supports string fields for robustness
         entries, uuids = storage.read_entries(metadata_query={"name": Have("entry1")})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
+        
+        # Have should not match non-string, non-list fields (like integers)
+        entries, uuids = storage.read_entries(metadata_query={"count": Have(42)})
         assert len(entries) == 0
     
     def test_have_wrapper_combined_with_other_conditions(self, storage):
@@ -617,6 +623,125 @@ class TestMetadataStorage:
         entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1"), "seed": In(0, 1)})
         assert len(entries) == 1
         assert entries[0]["metadata"]["name"] == "entry1"
+    
+    def test_have_wrapper_with_string_field(self, storage):
+        """Test Have wrapper robustness with single string field"""
+        # Create entries with string fields (not lists)
+        storage.create_entry(metadata={"category": "tag1", "name": "entry1"})
+        storage.create_entry(metadata={"category": "tag2", "name": "entry2"})
+        storage.create_entry(metadata={"category": "tag3", "name": "entry3"})
+        
+        # Have should match string fields that equal one of the query values
+        entries, uuids = storage.read_entries(metadata_query={"category": Have("tag1")})
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
+        
+        # Match multiple string values
+        entries, uuids = storage.read_entries(metadata_query={"category": Have("tag1", "tag3")})
+        assert len(entries) == 2
+        names = {entry["metadata"]["name"] for entry in entries}
+        assert names == {"entry1", "entry3"}
+    
+    def test_append_to_metadata_list_basic(self, storage):
+        """Test appending values to metadata list field"""
+        # Create entry with existing list
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
+        
+        # Append single value
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag3")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag2", "tag3"]
+    
+    def test_append_to_metadata_list_multiple_values(self, storage):
+        """Test appending multiple values to metadata list field"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1"], "name": "entry1"})
+        
+        # Append multiple values
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag2", "tag3", "tag4"])
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag2", "tag3", "tag4"]
+    
+    def test_append_to_metadata_list_create_if_missing(self, storage):
+        """Test creating list field if it doesn't exist"""
+        uuid = storage.create_entry(metadata={"name": "entry1"})
+        
+        # Append to non-existent field (should create it)
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag1")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1"]
+    
+    def test_append_to_metadata_list_no_create_if_missing(self, storage):
+        """Test error when field doesn't exist and create_if_missing is False"""
+        uuid = storage.create_entry(metadata={"name": "entry1"})
+        
+        with pytest.raises(ValueError, match="does not exist and create_if_missing is False"):
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag1", create_if_missing=False)
+    
+    def test_append_to_metadata_list_avoid_duplicates(self, storage):
+        """Test that duplicate values are not appended"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
+        
+        # Try to append existing value
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag1")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        # Should still have only one "tag1"
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag2"]
+    
+    def test_append_to_metadata_list_non_list_field(self, storage):
+        """Test error when trying to append to non-list field"""
+        uuid = storage.create_entry(metadata={"category": "value", "name": "entry1"})
+        
+        with pytest.raises(ValueError, match="is not a list"):
+            storage.append_to_metadata_list(uuid_query=uuid, key="category", values="new_value")
+    
+    def test_append_to_metadata_list_by_metadata_query(self, storage):
+        """Test appending to multiple entries using metadata query"""
+        storage.create_entry(metadata={"type": "train", "tags": ["tag1"], "name": "entry1"})
+        storage.create_entry(metadata={"type": "train", "tags": ["tag2"], "name": "entry2"})
+        storage.create_entry(metadata={"type": "eval", "tags": ["tag3"], "name": "entry3"})
+        
+        # Append to all "train" entries
+        storage.append_to_metadata_list(
+            metadata_query={"type": "train"},
+            key="tags",
+            values="processed",
+            allow_multiple=True
+        )
+        
+        entries, uuids = storage.read_entries(metadata_query={"type": "train"})
+        assert len(entries) == 2
+        for entry in entries:
+            assert "processed" in entry["metadata"]["tags"]
+        
+        # Eval entry should not have "processed"
+        entries, uuids = storage.read_entries(metadata_query={"type": "eval"})
+        assert "processed" not in entries[0]["metadata"]["tags"]
+    
+    def test_append_to_metadata_list_multiple_entries_without_allow(self, storage):
+        """Test error when multiple entries match but allow_multiple is False"""
+        storage.create_entry(metadata={"type": "train", "tags": ["tag1"]})
+        storage.create_entry(metadata={"type": "train", "tags": ["tag2"]})
+        
+        with pytest.raises(ValueError, match="Multiple entries found.*allow_multiple is False"):
+            storage.append_to_metadata_list(
+                metadata_query={"type": "train"},
+                key="tags",
+                values="new_tag",
+                allow_multiple=False
+            )
+    
+    def test_append_to_metadata_list_no_entries_found(self, storage):
+        """Test error when no entries match the query"""
+        with pytest.raises(ValueError, match="No entries found"):
+            storage.append_to_metadata_list(
+                uuid_query="nonexistent-uuid",
+                key="tags",
+                values="tag1"
+            )
 
 
 if __name__ == "__main__":
