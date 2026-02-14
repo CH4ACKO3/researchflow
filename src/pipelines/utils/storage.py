@@ -1055,17 +1055,18 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def append_to_metadata_list(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, key: str = None, values: Union[Any, List[Any]] = None, allow_multiple: bool = False, create_if_missing: bool = True):
+    def append_to_metadata_list(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, key: str = None, values: Union[Any, List[Any]] = None, allow_multiple: bool = False, create_if_missing: bool = True, operation: str = "append"):
         """
-        Append values to a list field in entry metadata
+        Modify a list field in entry metadata (append or remove values)
         
         Args:
             uuid_query: UUID or list of UUIDs to match
             metadata_query: Metadata conditions to match
-            key: Metadata key to append to (must be a list or will be created as list)
-            values: Single value or list of values to append
+            key: Metadata key to modify (must be a list or will be created as list for append)
+            values: Single value or list of values to append/remove
             allow_multiple: If True, allow updating multiple entries
-            create_if_missing: If True, create the list field if it doesn't exist; if False, raise error
+            create_if_missing: If True, create the list field if it doesn't exist (only for append); if False, raise error
+            operation: Operation to perform - "append" to add values, "remove" to delete values
         
         Examples:
             # Append single tag to an entry
@@ -1074,6 +1075,9 @@ class MetadataStorage:
             # Append multiple tags to an entry
             storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag_x", "tag_y"])
             
+            # Remove tag from an entry
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag_x", operation="remove")
+            
             # Append tag to all entries matching metadata query
             storage.append_to_metadata_list(metadata_query={"type": "train"}, key="tags", values="processed", allow_multiple=True)
         """
@@ -1081,6 +1085,8 @@ class MetadataStorage:
             raise ValueError("key parameter is required")
         if values is None:
             raise ValueError("values parameter is required")
+        if operation not in ["append", "remove"]:
+            raise ValueError(f"operation must be 'append' or 'remove', got '{operation}'")
         
         # Normalize values to list
         if not isinstance(values, list):
@@ -1104,32 +1110,41 @@ class MetadataStorage:
             if len(matched_entries) > 1 and not allow_multiple:
                 raise ValueError(f"Multiple entries found ({len(matched_entries)}), but allow_multiple is False")
             
-            # Append values to each matched entry
+            # Modify values for each matched entry
             for matched_entry in matched_entries:
                 metadata = matched_entry["metadata"]
                 
                 if key not in metadata:
-                    if create_if_missing:
-                        # Create new list field
+                    if operation == "append" and create_if_missing:
+                        # Create new list field for append operation
                         metadata[key] = []
                         logger.debug(f"Created new list field '{key}' in metadata")
                     else:
-                        raise ValueError(f"Metadata key '{key}' does not exist and create_if_missing is False")
+                        raise ValueError(f"Metadata key '{key}' does not exist")
                 
                 # Check if existing value is a list
                 if not isinstance(metadata[key], list):
                     raise ValueError(f"Metadata key '{key}' exists but is not a list (type: {type(metadata[key]).__name__})")
                 
-                # Append values (avoid duplicates)
-                for value in values:
-                    if value not in metadata[key]:
-                        metadata[key].append(value)
-                        logger.debug(f"Appended '{value}' to metadata['{key}']")
-                    else:
-                        logger.debug(f"Value '{value}' already exists in metadata['{key}'], skipped")
+                if operation == "append":
+                    # Append values (avoid duplicates)
+                    for value in values:
+                        if value not in metadata[key]:
+                            metadata[key].append(value)
+                            logger.debug(f"Appended '{value}' to metadata['{key}']")
+                        else:
+                            logger.debug(f"Value '{value}' already exists in metadata['{key}'], skipped")
+                else:  # operation == "remove"
+                    # Remove values
+                    for value in values:
+                        if value in metadata[key]:
+                            metadata[key].remove(value)
+                            logger.debug(f"Removed '{value}' from metadata['{key}']")
+                        else:
+                            logger.debug(f"Value '{value}' not found in metadata['{key}'], skipped")
             
             self._save_index()
-            logger.debug(f"Appended values to metadata key '{key}' for {len(matched_entries)} entries")
+            logger.info(f"{operation.capitalize()}ed values to metadata key '{key}' for {len(matched_entries)} entries")
         finally:
             self._release_lock()
     
@@ -1414,7 +1429,7 @@ class MetadataStorage:
         finally:
             self._release_lock()
     
-    def analyze_metadata_fields(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[List[str], Dict[str, List[Any]]]:
+    def analyze_metadata_fields(self, uuid_query: Optional[Union[List[str], str]] = None, metadata_query: Optional[Dict[str, Any]] = None, exact_match: bool = False) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
         """
         Analyze metadata fields across queried entries to identify consistent and inconsistent fields
         
@@ -1425,7 +1440,8 @@ class MetadataStorage:
             
         Returns:
             Tuple of:
-            - consistent_fields: List of field names that have the same value across all entries
+            - consistent_fields: Dict mapping field names to their consistent value across all entries
+                                 Format: {"batch_size": 32, "learning_rate": 0.001, ...}
             - inconsistent_fields: Dict mapping field names to list of all possible values (including None)
                                    Format: {"seed": [None, 0, 1, 42], "model": ["resnet", "vgg"], ...}
         """
@@ -1437,7 +1453,7 @@ class MetadataStorage:
             
             if not entries:
                 logger.debug("No entries found for analysis")
-                return [], {}
+                return {}, {}
             
             # Collect all field names across all entries
             all_fields = set()
@@ -1446,7 +1462,7 @@ class MetadataStorage:
                 all_fields.update(metadata.keys())
             
             # Analyze each field
-            consistent_fields = []
+            consistent_fields = {}
             inconsistent_fields = {}
             
             for field in all_fields:
@@ -1477,7 +1493,7 @@ class MetadataStorage:
                 # Determine if field is consistent or inconsistent
                 if len(unique_values) == 1:
                     # All entries have the same value for this field
-                    consistent_fields.append(field)
+                    consistent_fields[field] = unique_values[0]
                 else:
                     # Field has different values across entries
                     inconsistent_fields[field] = unique_values

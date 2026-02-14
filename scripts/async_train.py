@@ -267,14 +267,15 @@ class TaskIO:
                     continue
 
                 try:
-                    if complete and should_stop:
+                    if complete:
                         with file_path.open("r") as src, target_path.open("a") as dst:
-                            dst.write(src.read())
+                            content = src.read()
+                            if not should_stop:
+                                content += "\n"
+                            dst.write(content)
                         file_path.unlink()
-                    elif complete:
-                        with file_path.open("r") as src, target_path.open("a") as dst:
-                            dst.write(src.read() + "\n")
-                    self.file_last_mtime[file_path] = file_path.stat().st_mtime
+                    else:
+                        self.file_last_mtime[file_path] = file_path.stat().st_mtime
                 except (OSError, IOError) as e:
                     history_logger.error(f"Error archiving file {file_path}: {e}")
             except Exception as e:

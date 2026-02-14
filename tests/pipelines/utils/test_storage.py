@@ -677,7 +677,7 @@ class TestMetadataStorage:
         """Test error when field doesn't exist and create_if_missing is False"""
         uuid = storage.create_entry(metadata={"name": "entry1"})
         
-        with pytest.raises(ValueError, match="does not exist and create_if_missing is False"):
+        with pytest.raises(ValueError, match="does not exist"):
             storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag1", create_if_missing=False)
     
     def test_append_to_metadata_list_avoid_duplicates(self, storage):
@@ -742,6 +742,116 @@ class TestMetadataStorage:
                 key="tags",
                 values="tag1"
             )
+    
+    def test_append_to_metadata_list_remove_operation_basic(self, storage):
+        """Test removing values from metadata list field"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2", "tag3"], "name": "entry1"})
+        
+        # Remove single value
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag2", operation="remove")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag3"]
+    
+    def test_append_to_metadata_list_remove_multiple_values(self, storage):
+        """Test removing multiple values from metadata list field"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2", "tag3", "tag4"], "name": "entry1"})
+        
+        # Remove multiple values
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag2", "tag4"], operation="remove")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag3"]
+    
+    def test_append_to_metadata_list_remove_nonexistent_value(self, storage):
+        """Test removing value that doesn't exist in list (should not error)"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
+        
+        # Try to remove non-existent value (should not error, just skip)
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag_nonexistent", operation="remove")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        # List should remain unchanged
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag2"]
+    
+    def test_append_to_metadata_list_remove_from_missing_field(self, storage):
+        """Test error when removing from non-existent field"""
+        uuid = storage.create_entry(metadata={"name": "entry1"})
+        
+        # Should raise error since field doesn't exist
+        with pytest.raises(ValueError, match="does not exist"):
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag1", operation="remove")
+    
+    def test_append_to_metadata_list_remove_from_non_list_field(self, storage):
+        """Test error when removing from non-list field"""
+        uuid = storage.create_entry(metadata={"category": "value", "name": "entry1"})
+        
+        with pytest.raises(ValueError, match="is not a list"):
+            storage.append_to_metadata_list(uuid_query=uuid, key="category", values="value", operation="remove")
+    
+    def test_append_to_metadata_list_remove_by_metadata_query(self, storage):
+        """Test removing from multiple entries using metadata query"""
+        storage.create_entry(metadata={"type": "train", "tags": ["tag1", "tag2", "processed"], "name": "entry1"})
+        storage.create_entry(metadata={"type": "train", "tags": ["tag3", "processed"], "name": "entry2"})
+        storage.create_entry(metadata={"type": "eval", "tags": ["tag4", "processed"], "name": "entry3"})
+        
+        # Remove "processed" from all "train" entries
+        storage.append_to_metadata_list(
+            metadata_query={"type": "train"},
+            key="tags",
+            values="processed",
+            operation="remove",
+            allow_multiple=True
+        )
+        
+        entries, uuids = storage.read_entries(metadata_query={"type": "train"})
+        assert len(entries) == 2
+        for entry in entries:
+            assert "processed" not in entry["metadata"]["tags"]
+        
+        # Eval entry should still have "processed"
+        entries, uuids = storage.read_entries(metadata_query={"type": "eval"})
+        assert "processed" in entries[0]["metadata"]["tags"]
+    
+    def test_append_to_metadata_list_invalid_operation(self, storage):
+        """Test error when invalid operation is specified"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1"], "name": "entry1"})
+        
+        with pytest.raises(ValueError, match="operation must be 'append' or 'remove'"):
+            storage.append_to_metadata_list(uuid_query=uuid, key="tags", values="tag2", operation="invalid")
+    
+    def test_append_to_metadata_list_remove_all_values(self, storage):
+        """Test removing all values from a list"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
+        
+        # Remove all values
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag1", "tag2"], operation="remove")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        # List should be empty but still exist
+        assert entries[0]["metadata"]["tags"] == []
+    
+    def test_append_to_metadata_list_append_and_remove_sequence(self, storage):
+        """Test sequence of append and remove operations"""
+        uuid = storage.create_entry(metadata={"tags": ["tag1"], "name": "entry1"})
+        
+        # Append some tags
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag2", "tag3", "tag4"])
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag2", "tag3", "tag4"]
+        
+        # Remove some tags
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag2", "tag4"], operation="remove")
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag3"]
+        
+        # Append again (including a previously removed tag)
+        storage.append_to_metadata_list(uuid_query=uuid, key="tags", values=["tag2", "tag5"])
+        
+        entries, uuids = storage.read_entries(uuid_query=uuid)
+        assert entries[0]["metadata"]["tags"] == ["tag1", "tag3", "tag2", "tag5"]
 
 
 if __name__ == "__main__":
