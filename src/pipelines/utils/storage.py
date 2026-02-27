@@ -53,18 +53,18 @@ class Have:
     """
     Wrapper class for list element matching in metadata queries.
     
-    Matches if the entry's field value is a list containing at least one of the provided values.
-    For robustness, also matches string fields that equal one of the provided values.
+    Matches if the entry's field value is a list containing ALL of the provided values.
+    For robustness, also matches string fields that equal the single provided value.
     
     Example:
         # Match entries where tags list contains "tag1"
         metadata_query = {"tags": Have("tag1")}
         
-        # Match entries where tags list contains "tag1" or "tag2"
+        # Match entries where tags list contains both "tag1" AND "tag2"
         metadata_query = {"tags": Have("tag1", "tag2")}
         
-        # Also works with string fields (robustness feature)
-        metadata_query = {"category": Have("value1", "value2")}
+        # Also works with string fields (single value only)
+        metadata_query = {"category": Have("value1")}
     """
     
     def __init__(self, *values):
@@ -107,13 +107,13 @@ class MetadataStorage:
             entries, uuids = storage.read_entries(metadata_query={"seed": In(None, 42)})
     
     List element matching:
-        Use the Have wrapper to match entries where a field's list value contains at least one of the specified elements:
+        Use the Have wrapper to match entries where a field's list value contains all of the specified elements:
         
         Example:
             # Match entries where tags list contains "tag1"
             entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1")})
             
-            # Match entries where tags list contains "tag1" or "tag2"
+            # Match entries where tags list contains both "tag1" AND "tag2"
             entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1", "tag2")})
     
     Access time tracking:
@@ -1346,11 +1346,11 @@ class MetadataStorage:
             elif isinstance(query, Have):
                 # Support both list and single string values for robustness
                 if isinstance(this, list):
-                    # Standard case: field is a list
-                    return any(item in this for item in query.values)
+                    # Standard case: field is a list, all values must be present
+                    return all(item in this for item in query.values)
                 elif isinstance(this, str):
-                    # Robustness: if field is a single string, check if it matches any query value
-                    return this in query.values
+                    # Robustness: if field is a single string, check if it matches all query values
+                    return len(query.values) == 1 and this == query.values[0]
                 else:
                     return False
             elif isinstance(query, dict):

@@ -559,16 +559,15 @@ class TestMetadataStorage:
         assert names == {"entry1", "entry2"}
     
     def test_have_wrapper_multiple_values(self, storage):
-        """Test Have wrapper with multiple values (OR logic)"""
-        storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry1"})
-        storage.create_entry(metadata={"tags": ["tag3", "tag4"], "name": "entry2"})
+        """Test Have wrapper with multiple values (AND logic)"""
+        storage.create_entry(metadata={"tags": ["tag1", "tag2", "tag5"], "name": "entry1"})
+        storage.create_entry(metadata={"tags": ["tag1", "tag2"], "name": "entry2"})
         storage.create_entry(metadata={"tags": ["tag5"], "name": "entry3"})
         
-        # Match entries where tags list contains "tag1" OR "tag5"
+        # Match entries where tags list contains both "tag1" AND "tag5"
         entries, uuids = storage.read_entries(metadata_query={"tags": Have("tag1", "tag5")})
-        assert len(entries) == 2
-        names = {entry["metadata"]["name"] for entry in entries}
-        assert names == {"entry1", "entry3"}
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["name"] == "entry1"
     
     def test_have_wrapper_no_match(self, storage):
         """Test Have wrapper with no matching values"""
@@ -636,11 +635,9 @@ class TestMetadataStorage:
         assert len(entries) == 1
         assert entries[0]["metadata"]["name"] == "entry1"
         
-        # Match multiple string values
+        # Multiple values cannot all be present in a single string field, so no match
         entries, uuids = storage.read_entries(metadata_query={"category": Have("tag1", "tag3")})
-        assert len(entries) == 2
-        names = {entry["metadata"]["name"] for entry in entries}
-        assert names == {"entry1", "entry3"}
+        assert len(entries) == 0
     
     def test_append_to_metadata_list_basic(self, storage):
         """Test appending values to metadata list field"""
