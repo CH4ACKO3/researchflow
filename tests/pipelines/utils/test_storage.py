@@ -9,7 +9,6 @@ from typing import Dict, Any
 import threading
 from pipelines.utils.storage import MetadataStorage, In, Have
 
-
 class TestMetadataStorage:
     """Test suite for MetadataStorage class"""
     
@@ -35,6 +34,13 @@ class TestMetadataStorage:
         assert storage.lock_file == Path(temp_storage_dir) / ".lock"
         assert storage.index_data == {}
         assert storage._lock_count == 0
+        assert storage.storage_dir.exists()
+    
+    def test_init_with_path(self, temp_storage_dir):
+        """Test storage initialization with Path object"""
+        path_obj = Path(temp_storage_dir)
+        storage = MetadataStorage(path_obj)
+        assert storage.storage_dir == path_obj
         assert storage.storage_dir.exists()
     
     def test_create_entry_basic(self, storage):

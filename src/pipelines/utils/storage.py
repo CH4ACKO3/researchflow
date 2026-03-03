@@ -122,12 +122,12 @@ class MetadataStorage:
         This enables future cleanup based on access patterns.
     """
     
-    def __init__(self, storage_dir: str = "storage"):
+    def __init__(self, storage_dir: Union[str, Path] = "storage"):
         """
         Initialize storage system
         
         Args:
-            storage_dir: File storage directory
+            storage_dir: File storage directory (str or Path)
             index_file: Index file name
         """
         self.storage_dir: Path = Path(storage_dir)
