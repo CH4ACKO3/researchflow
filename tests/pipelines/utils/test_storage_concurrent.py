@@ -194,9 +194,8 @@ class TestMetadataStorageConcurrent:
             except Exception as e:
                 with lock:
                     errors.append(("creator", thread_id, str(e)))
-            finally:
-                with lock:
-                    created_uuids.extend(thread_uuids)
+            with lock:
+                created_uuids.extend(thread_uuids)
         
         def read_entries(thread_id):
             storage = MetadataStorage(temp_storage_dir)

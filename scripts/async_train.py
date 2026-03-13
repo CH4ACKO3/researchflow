@@ -1,7 +1,48 @@
+"""
+scripts/async_train.py
+Asynchronous GPU job scheduler that consumes job lists and dispatches shell tasks to available GPUs.
+
+## Workflow Position
+This file implements the scheduling stage in the project workflow (job list execution). It watches
+`jobs/`, updates task states, dispatches runnable tasks onto GPUs, writes runtime history logs to
+`logs/history/`, and archives completed job files into `processed/`.
+
+## Main Components
+- `get_system_memory_usage`: Reads `/proc/meminfo` and returns system memory usage percentage.
+- `parse_task`: Parses one task line from job files into `(command, status)`.
+- `TaskIO`: Synchronizes task states between in-memory pools/queues and `jobs/*.txt` files.
+- `ProcessorWorker`: Per-GPU scheduler/runner that monitors NVML metrics and starts/stops subprocesses.
+- `monitor_gpus`: Watches `available_gpus.txt` and refreshes the global GPU allow-list.
+- `console_printer`: Renders live terminal status for queue and worker states.
+- `main`: Bootstraps all async loops and performs coordinated shutdown.
+
+## Inputs
+- CLI args: `--max-memory`, `--max-util`, `--grace-period`, `--max-retries`, `--debug`.
+- Files:
+  - `available_gpus.txt` for externally controlled GPU allow-list.
+  - `jobs/**/*.txt` where each line is a shell task with optional status prefix (`!`, `#`, `?`).
+
+## Outputs / Side Effects
+- Updates `jobs/**/*.txt` in-place with normalized status markers.
+- Moves fully finished job files to `processed/**/*.old`.
+- Appends scheduler/task runtime logs to `logs/history/history.log`.
+- Spawns and terminates subprocesses with GPU/CPU affinity environment settings.
+
+## Key Dependencies
+- `pynvml`: GPU memory/utilization polling.
+- `asyncio`: Concurrent queueing, polling, process management, and lifecycle control.
+- `logging.handlers.TimedRotatingFileHandler`: Daily rotating scheduler history logs.
+
+## Notes
+- Task states are mirrored between files and in-memory pools; file mtimes are used to detect
+  external edits and choose reconciliation direction.
+- `available_gpus.txt` acts as an external kill switch: when a GPU is removed, running tasks on it
+  are terminated and pushed back to waiting.
+"""
+
 import asyncio
 import sys
 import os
-import fileinput
 import time
 import datetime
 import subprocess
@@ -10,6 +51,7 @@ import logging, logging.handlers
 import argparse
 from collections import defaultdict, deque
 import pathlib
+import unicodedata
 
 def get_system_memory_usage():
     """Get system memory usage percentage"""
@@ -39,10 +81,52 @@ def get_system_memory_usage():
 pynvml.nvmlInit()
 
 # Initialize logging
+def migrate_latest_history_log(log_file_path):
+    """
+    On startup, move existing history.log content to the latest archived log,
+    so current history.log only contains the current scheduler run.
+    """
+    try:
+        if (not log_file_path.exists()) or log_file_path.stat().st_size == 0:
+            return
+
+        archive_candidates = sorted(
+            log_file_path.parent.glob(f"{log_file_path.name}.*"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if archive_candidates:
+            archive_path = archive_candidates[-1]
+        else:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d")
+            archive_path = log_file_path.with_name(f"{log_file_path.name}.{ts}.startup")
+
+        with log_file_path.open("r", encoding="utf-8", errors="replace") as src:
+            old_content = src.read()
+        if not old_content:
+            return
+        if not old_content.endswith("\n"):
+            old_content += "\n"
+
+        with archive_path.open("a+", encoding="utf-8") as dst:
+            dst.seek(0, os.SEEK_END)
+            size = dst.tell()
+            if size > 0:
+                dst.seek(size - 1)
+                if dst.read(1) != "\n":
+                    dst.write("\n")
+            dst.write(old_content)
+
+        # Clear current log so it only keeps this run.
+        with log_file_path.open("w", encoding="utf-8"):
+            pass
+    except Exception as e:
+        print(f"Failed to migrate history.log on startup: {e}", file=sys.stderr)
+
 history_logger = logging.getLogger()
 history_logger.setLevel(logging.INFO)
 log_file_path = pathlib.Path("logs/history/history.log")
 log_file_path.parent.mkdir(parents=True, exist_ok=True)
+migrate_latest_history_log(log_file_path)
 file_handler = logging.handlers.TimedRotatingFileHandler(str(log_file_path), when="midnight", backupCount=7)
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -63,6 +147,7 @@ available_gpus = []
 gpus_lock = asyncio.Lock()
 
 def parse_task(line):
+    # Prefix markers in job files: ! running, # finished, ? terminated, no prefix waiting.
     if line.startswith("!"):
         return line[1:].strip(), "running"
     elif line.startswith("#"):
@@ -72,6 +157,79 @@ def parse_task(line):
     else:
         return line.strip(), "waiting"
 
+def is_stage_barrier(line):
+    # A single '&' line acts as a stage barrier.
+    # Also tolerate accidental status prefixes ("# &", "! &", "? &") from old states.
+    stripped = line.strip()
+    if stripped == "&":
+        return True
+    if stripped and stripped[0] in "!#?":
+        return stripped[1:].strip() == "&"
+    return False
+
+def text_display_width(text):
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return width
+
+def fit_text_to_width(text, max_width):
+    if max_width <= 0:
+        return ""
+    if text_display_width(text) <= max_width:
+        return text
+    ellipsis = "..."
+    ellipsis_width = text_display_width(ellipsis)
+    if max_width <= ellipsis_width:
+        return "." * max_width
+    kept = []
+    used = 0
+    for ch in text:
+        ch_width = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1)
+        if used + ch_width + ellipsis_width > max_width:
+            break
+        kept.append(ch)
+        used += ch_width
+    return "".join(kept) + ellipsis
+
+def pad_text_display(text, target_width):
+    visible = fit_text_to_width(text, target_width)
+    pad = max(0, target_width - text_display_width(visible))
+    return visible + (" " * pad)
+
+class HybridTaskQueue:
+    """
+    Queue with a front lane for urgent requeue.
+    - Normal tasks go to `back_queue` (FIFO).
+    - Urgent tasks use `front_queue` and are consumed first.
+    """
+    def __init__(self):
+        self.front_queue = deque()
+        self.back_queue = asyncio.Queue()
+
+    async def put(self, task):
+        # Keep async signature to match asyncio.Queue usage in existing code.
+        self.back_queue.put_nowait(task)
+
+    def put_nowait(self, task):
+        self.back_queue.put_nowait(task)
+
+    async def put_front(self, task):
+        self.front_queue.append(task)
+
+    def put_front_nowait(self, task):
+        self.front_queue.append(task)
+
+    def get_nowait(self):
+        if self.front_queue:
+            return self.front_queue.popleft()
+        return self.back_queue.get_nowait()
+
+    def qsize(self):
+        return len(self.front_queue) + self.back_queue.qsize()
+
 class TaskIO:
     def __init__(self, jobs_dir="jobs", processed_dir="processed"):
         self.jobs_dir = pathlib.Path(jobs_dir)
@@ -80,12 +238,14 @@ class TaskIO:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup async data structures
-        self.task_queue = asyncio.Queue()
+        self.task_queue = HybridTaskQueue()
         self.message_queue = asyncio.Queue()
         self.task_pool = defaultdict(set)
         self.task_pool_lock = asyncio.Lock()
         self.file_with_changes = set()
         self.file_last_mtime = defaultdict(float)  # Key: Path object
+        self.file_blocked_waiting_tasks = defaultdict(set)  # Key: Path object -> blocked waiting task strings
+        self.file_task_stats = {}
         self.file_io_lock = asyncio.Lock()
         
         self.scan_switch = True
@@ -114,15 +274,29 @@ class TaskIO:
                 break
         self.task_pool[target_status].add(task)
 
-    def task_to_line(self, task, status, first_line_flag):
+    def task_to_line(self, task, status):
         if status == "finished":
-            return f"{'\n' if not first_line_flag else ''}# {task}"
+            return f"# {task}"
         elif status == "terminated":
-            return f"{'\n' if not first_line_flag else ''}? {task}"
+            return f"? {task}"
         elif status == "running":
-            return f"{'\n' if not first_line_flag else ''}! {task}"
+            return f"! {task}"
         else:
-            return f"{'\n' if not first_line_flag else ''}{task}"
+            return task
+
+    @staticmethod
+    def render_lines(lines):
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def write_lines_atomically(file_path, lines):
+        content = TaskIO.render_lines(lines)
+        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, file_path)
 
     async def monitor_file(self):
         try:
@@ -209,43 +383,67 @@ class TaskIO:
                 os_mtime = file_path.stat().st_mtime
                 internal_mtime = self.file_last_mtime[file_path]
                 complete = True
-                first_line_flag = True
+                prior_stages_finished = True
+                current_stage_finished = True
+                previously_blocked = self.file_blocked_waiting_tasks[file_path]
+                current_blocked = set()
+                output_lines = []
                 
                 try:
-                    for line in fileinput.input(str(file_path), inplace=True):
+                    with file_path.open("r", encoding="utf-8") as src:
+                        source_lines = src.readlines()
+                    for line in source_lines:
                         try:
-                            if not line.strip() == "" and len(line.split())>1:
+                            stripped = line.strip()
+                            if stripped == "":
+                                continue
+
+                            if is_stage_barrier(line):
+                                output_lines.append("&")
+                                complete = complete and (prior_stages_finished and current_stage_finished)
+                                prior_stages_finished = prior_stages_finished and current_stage_finished
+                                current_stage_finished = True
+                                continue
+
+                            if stripped:
                                 task, file_status = parse_task(line)
+                                task_blocked = not prior_stages_finished
                                 if should_stop:
                                     if file_status == "running":
-                                        line = self.task_to_line(task, "waiting", first_line_flag)
+                                        line = self.task_to_line(task, "waiting")
                                     else:
-                                        line = self.task_to_line(task, file_status, first_line_flag)
+                                        line = self.task_to_line(task, file_status)
+                                    _, current_status = parse_task(line)
                                 else:
                                     pool_status = self.query_pool_status(task)
                                     if internal_mtime > 0.0 and internal_mtime != os_mtime:
-                                        # 文件被外部修改，以文件状态为准
-                                        if file_status == "waiting" and pool_status != "waiting":
+                                        # Job file was externally modified; file status takes precedence.
+                                        if file_status == "waiting" and pool_status != "waiting" and not task_blocked:
                                             self.task_queue.put_nowait(task)
                                         self.change_pool_status(task, file_status)
+                                        current_status = file_status
                                     else:
-                                        # 首次启动或文件未被外部修改
+                                        # Initial bootstrap or unchanged file; in-memory pool drives status.
                                         if pool_status is None:
-                                            # 新任务，需要初始化到pool中
+                                            # New task discovered; initialize pool and queue state.
                                             if file_status == "finished":
-                                                # 已完成任务：加入pool但不加入队列，保持finished状态
+                                                # Keep completed tasks out of the queue.
                                                 self.change_pool_status(task, "finished")
                                                 pool_status = "finished"
                                             elif file_status == "terminated":
-                                                # 有问题的任务：改为waiting状态并加入队列，重新尝试
-                                                self.change_pool_status(task, "waiting")
-                                                pool_status = "waiting"
-                                                await self.task_queue.put(task)
+                                                # Keep terminated tasks terminated; do not auto-retry.
+                                                self.change_pool_status(task, "terminated")
+                                                pool_status = "terminated"
                                             else:
-                                                # waiting或running状态的任务：改为waiting并加入队列
+                                                # Normalize waiting/running file states into queue-backed waiting.
                                                 self.change_pool_status(task, "waiting")
                                                 pool_status = "waiting"
-                                                await self.task_queue.put(task)
+                                                if not task_blocked:
+                                                    await self.task_queue.put(task)
+
+                                        if pool_status == "waiting" and (not task_blocked) and task in previously_blocked:
+                                            # Task was blocked by a previous '&' stage; enqueue once after unlock.
+                                            await self.task_queue.put(task)
 
                                         if pool_status == "finished" and file_status != "finished":
                                             self.file_with_changes.add(file_path)
@@ -253,28 +451,49 @@ class TaskIO:
                                         if pool_status != "finished":
                                             complete = False
                                         
-                                        line = self.task_to_line(task, pool_status, first_line_flag)
+                                        line = self.task_to_line(task, pool_status)
+                                        current_status = pool_status
                                 
-                                sys.stdout.write(line)
-                                _, current_status = parse_task(line)
+                                if task_blocked and current_status == "waiting":
+                                    current_blocked.add(task)
+
+                                output_lines.append(line)
                                 complete = complete and current_status == "finished"
-                                first_line_flag = False
+                                current_stage_finished = current_stage_finished and current_status == "finished"
                         except Exception as e:
                             history_logger.error(f"Error processing line in {file_path}: {e}")
-                            sys.stdout.write(line)
+                            output_lines.append(line.rstrip("\n"))
                 except Exception as e:
                     history_logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
                     continue
 
+                self.file_blocked_waiting_tasks[file_path] = current_blocked
+                file_stats = {"waiting": 0, "running": 0, "finished": 0}
+                for out_line in output_lines:
+                    if out_line == "&":
+                        continue
+                    _, status = parse_task(out_line)
+                    if status == "running":
+                        file_stats["running"] += 1
+                    elif status == "finished":
+                        file_stats["finished"] += 1
+                    else:
+                        # Treat waiting and terminated as "remaining" from file perspective.
+                        file_stats["waiting"] += 1
+                self.file_task_stats[file_path] = file_stats
+
                 try:
                     if complete:
-                        with file_path.open("r") as src, target_path.open("a") as dst:
-                            content = src.read()
-                            if not should_stop:
-                                content += "\n"
+                        content = self.render_lines(output_lines)
+                        with target_path.open("a", encoding="utf-8") as dst:
                             dst.write(content)
+                            if not should_stop:
+                                dst.write("\n")
                         file_path.unlink()
+                        self.file_blocked_waiting_tasks.pop(file_path, None)
+                        self.file_task_stats.pop(file_path, None)
                     else:
+                        self.write_lines_atomically(file_path, output_lines)
                         self.file_last_mtime[file_path] = file_path.stat().st_mtime
                 except (OSError, IOError) as e:
                     history_logger.error(f"Error archiving file {file_path}: {e}")
@@ -282,13 +501,14 @@ class TaskIO:
                 history_logger.error(f"Error syncing file {file_path}: {e}", exc_info=True)
 
 class ProcessorWorker:
-    def __init__(self, gpu_id, max_memory=40, max_util=80, grace_period=120, debug=False):
+    def __init__(self, gpu_id, max_memory=40, max_util=80, grace_period=120, max_retries=3, debug=False):
         self.gpu_id = gpu_id
         self.status_lock = asyncio.Lock()
         self.status = "starting"
         self.max_memory = max_memory
         self.max_util = max_util
         self.grace_period = grace_period
+        self.max_retries = max_retries
         self.last_task_time = None
         self.last_task_end_time = None
         self.task_start_times = dict()
@@ -298,6 +518,7 @@ class ProcessorWorker:
         self.util.append(0)
         self.running_proc = dict()
         self.log_readers = dict()  # task -> (stdout_task, stderr_task)
+        self.retry_counts = defaultdict(int)  # task -> retry count for non-zero exits
         self.debug = debug
         self.last_occupied_time = None
         
@@ -385,10 +606,10 @@ class ProcessorWorker:
                         async with gpus_lock:
                             self_available = self.gpu_id in available_gpus
                         
-                        # 判断是否为外部占用：没有自己的进程，但有使用率，且不是刚结束任务（避免误判）
+                        # Detect external occupancy: no managed process but sustained usage not caused by recent completion.
                         time_since_last_end = (time.time() - self.last_task_end_time) if self.last_task_end_time else float('inf')
                         if (self.last_task_time is None) and (not self.running_proc) and (avg_util_pct > 10 or max_memory_pct > 10) and time_since_last_end > 30:
-                            if self.status != "occupied":  # 只在第一次进入occupied状态时设置时间
+                            if self.status != "occupied":  # Record entry time only once per occupied period.
                                 self.status = "occupied"
                                 self.last_occupied_time = time.time()
                         elif self_available \
@@ -442,15 +663,40 @@ class ProcessorWorker:
                                 if proc_status is not None:
                                     tasks_to_remove.append(task)
                                     if proc_status == 0:
+                                        self.retry_counts.pop(task, None)
                                         status = "finished"
                                         history_logger.info(f"GPU {self.gpu_id} finished task: {task}")
                                     else:
-                                        status = "terminated"
-                                        history_logger.warning(f"GPU {self.gpu_id} terminated task with code {proc_status}: {task}")
+                                        retry_count = self.retry_counts[task] + 1
+                                        if retry_count <= self.max_retries:
+                                            self.retry_counts[task] = retry_count
+                                            # Generic subprocess failure: retry from queue tail.
+                                            async with self.task_pool_lock:
+                                                self.task_pool["running"].discard(task)
+                                                self.task_pool["waiting"].add(task)
+                                            self.task_queue.put_nowait(task)
+                                            status = "waiting"
+                                            history_logger.warning(
+                                                f"GPU {self.gpu_id} task failed with code {proc_status}, retry "
+                                                f"{retry_count}/{self.max_retries}: {task}"
+                                            )
+                                        else:
+                                            self.retry_counts.pop(task, None)
+                                            status = "terminated"
+                                            history_logger.warning(
+                                                f"GPU {self.gpu_id} task failed with code {proc_status}, "
+                                                f"retries exhausted ({self.max_retries}): {task}"
+                                            )
                                     self.message_queue.put_nowait((task, status))
                                     self.task_start_times.pop(task, None)
                                 elif not self_available:
                                     tasks_to_remove.append(task)
+                                    # GPU removed externally: interrupt and urgently requeue at queue front.
+                                    async with self.task_pool_lock:
+                                        if task in self.task_pool["running"]:
+                                            self.task_pool["running"].discard(task)
+                                            self.task_pool["waiting"].add(task)
+                                    self.task_queue.put_front_nowait(task)
                                     self.message_queue.put_nowait((task, "waiting"))
                                     self.task_start_times.pop(task, None)
                                     proc.terminate()
@@ -543,7 +789,7 @@ async def monitor_gpus():
     finally:
         history_logger.debug("monitor_gpus task stopped")
 
-async def console_printer(gpu_workers, queue):
+async def console_printer(gpu_workers, task_io):
     try:
         while True:
             try:
@@ -564,13 +810,47 @@ async def console_printer(gpu_workers, queue):
                     except Exception as e:
                         history_logger.error(f"Error getting status info: {e}")
                 
-                left_tasks = queue.qsize()
                 system_memory_pct = get_system_memory_usage()
                 
                 try:
                     console_logger.info("\033[2J\033[H")
                     console_logger.info("-" * columns)
-                    console_logger.info(f"Task in queue: {left_tasks}, System Memory: {system_memory_pct:.2f}%")
+                    console_logger.info(f"System Memory: {system_memory_pct:.2f}%")
+                    async with task_io.file_io_lock:
+                        job_stats = sorted(task_io.file_task_stats.items(), key=lambda x: str(x[0]))
+                    if not job_stats:
+                        console_logger.info("No active job files")
+                    else:
+                        rel_names = [str(file_path.relative_to(task_io.jobs_dir)) for file_path, _ in job_stats]
+                        max_name_len = max(text_display_width("TOTAL"), *(text_display_width(name) for name in rel_names))
+                        fixed_metric_width = len(" | waiting: 00000 | running: 00000 | finished: 00000")
+                        max_allowed_name = max(12, columns - fixed_metric_width)
+                        name_width = min(max_name_len, max_allowed_name)
+
+                        total_waiting = 0
+                        total_running = 0
+                        total_finished = 0
+
+                        def format_row(name, waiting, running, finished):
+                            name_col = pad_text_display(name, name_width)
+                            return (
+                                f"{name_col} | waiting: {waiting:5d} | "
+                                f"running: {running:5d} | finished: {finished:5d}"
+                            )
+
+                        for file_path, stats in job_stats:
+                            relative_name = str(file_path.relative_to(task_io.jobs_dir))
+                            waiting = stats["waiting"]
+                            running = stats["running"]
+                            finished = stats["finished"]
+                            total_waiting += waiting
+                            total_running += running
+                            total_finished += finished
+                            console_logger.info(format_row(relative_name, waiting, running, finished))
+
+                        console_logger.info(
+                            format_row("TOTAL", total_waiting, total_running, total_finished)
+                        )
                     console_logger.info("-" * columns)
                     console_logger.info(total_info)
                     console_logger.info("-" * columns)
@@ -597,6 +877,8 @@ async def main():
                         help='Maximum GPU utilization percentage (default: 80.0)')
     parser.add_argument('--grace-period', type=int, default=180,
                         help='Grace period in seconds before starting new task after last task (default: 180)')
+    parser.add_argument('--max-retries', type=int, default=3,
+                        help='Maximum retries for non-zero exit tasks (default: 3)')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Debug mode')
     args = parser.parse_args()
@@ -627,9 +909,12 @@ async def main():
             history_logger.error(f"Failed to get GPU count: {e}")
             raise
         
-        gpu_workers = [ProcessorWorker(gpu_id, args.max_memory, args.max_util, args.grace_period, args.debug) for gpu_id in range(gpu_count)]
+        gpu_workers = [
+            ProcessorWorker(gpu_id, args.max_memory, args.max_util, args.grace_period, args.max_retries, args.debug)
+            for gpu_id in range(gpu_count)
+        ]
         gpu_worker_loops = [asyncio.create_task(gpu_worker.start(task_io.task_queue, task_io.message_queue, task_io.task_pool, task_io.task_pool_lock)) for gpu_worker in gpu_workers]
-        console_printer_loop = asyncio.create_task(console_printer(gpu_workers, task_io.task_queue))
+        console_printer_loop = asyncio.create_task(console_printer(gpu_workers, task_io))
         
         history_logger.info("All tasks started successfully")
         await asyncio.sleep(float('inf'))

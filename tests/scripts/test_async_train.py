@@ -170,7 +170,7 @@ class TestAsyncTrain:
             # Start async_train as subprocess with max_memory=50, grace_period=5
             script_path = Path(original_cwd) / "scripts" / "async_train.py"
             proc = subprocess.Popen(
-                ["uv", "run", "python", str(script_path), "--max-memory", "50", "--grace-period", "5"],
+                ["uv", "run", "--project", str(original_cwd), str(script_path), "--max-memory", "50", "--grace-period", "5"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=temp_test_dir
@@ -298,7 +298,7 @@ class TestAsyncTrain:
             # Start async_train with max_memory=50, grace_period=5
             script_path = Path(original_cwd) / "scripts" / "async_train.py"
             proc = subprocess.Popen(
-                ["uv", "run", "python", str(script_path), "--max-memory", "50", "--grace-period", "5"],
+                ["uv", "run", "--project", str(original_cwd), str(script_path), "--max-memory", "50", "--grace-period", "5"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=temp_test_dir
