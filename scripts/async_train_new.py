@@ -47,8 +47,10 @@ import time
 import datetime
 import subprocess
 import pynvml
-import logging, logging.handlers
+import logging
+import logging.handlers
 import argparse
+import threading
 from collections import defaultdict, deque
 import pathlib
 import unicodedata
@@ -81,10 +83,211 @@ def get_system_memory_usage():
 pynvml.nvmlInit()
 
 # Initialize logging
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+log_formatter = logging.Formatter(LOG_FORMAT)
+
+log_file_path = pathlib.Path("logs/history/history.log")
+log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# Unicode box-drawing: ╭─╮ ╰─╯ │ ├─┤ (rounded corners, T-junction for divider)
+_BOX_TL, _BOX_H, _BOX_TR = "\u256d", "\u2500", "\u256e"
+_BOX_L, _BOX_R = "\u2502", "\u2502"
+_BOX_BL, _BOX_BR = "\u2570", "\u256f"
+_BOX_DIV_L, _BOX_DIV_R = "\u251c", "\u2524"
+
+
+class HistoryLogBuffer:
+    """
+    Buffered history log with scheduler / GPU / process blocks.
+    Supports periodic rewrite and midnight rolling (only clears finished process blocks).
+    """
+    WIDTH = 160
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.scheduler_logs = []  # list of (asctime, levelname, message)
+        self.gpus = defaultdict(lambda: {"meta": [], "processes": {}})
+        self._last_roll_date = datetime.date.today()
+
+    def append_scheduler(self, record):
+        with self._lock:
+            self.scheduler_logs.append((
+                log_formatter.formatTime(record),
+                record.levelname,
+                record.getMessage(),
+            ))
+
+    def append_process(self, gpu_id, task, record):
+        with self._lock:
+            if task not in self.gpus[gpu_id]["processes"]:
+                self.gpus[gpu_id]["processes"][task] = {"meta": [], "logs": [], "finished": False}
+            self.gpus[gpu_id]["processes"][task]["logs"].append((
+                log_formatter.formatTime(record),
+                record.levelname,
+                record.getMessage(),
+            ))
+
+    def mark_process_finished(self, gpu_id, task):
+        with self._lock:
+            if task in self.gpus[gpu_id]["processes"]:
+                self.gpus[gpu_id]["processes"][task]["finished"] = True
+
+    def update_process_meta(self, gpu_id, task, meta_lines):
+        with self._lock:
+            if task in self.gpus[gpu_id]["processes"]:
+                self.gpus[gpu_id]["processes"][task]["meta"] = list(meta_lines)
+
+    def _fold_line(self, text, width):
+        """Fold long lines; width = content width (excluding | |)."""
+        lines = []
+        while text:
+            if len(text) <= width:
+                lines.append(text.ljust(width))
+                break
+            cut = text[:width].rfind(" ")
+            cut = width if cut <= 0 else cut
+            lines.append(text[:cut].ljust(width))
+            text = "  " + text[cut:].lstrip()
+        return lines
+
+    def _box_top(self, title=None):
+        h_len = self.WIDTH - 2
+        if title:
+            pad = h_len - 4 - len(title)
+            return f"{_BOX_TL}{_BOX_H}{_BOX_H} {title} {_BOX_H * max(0, pad)}{_BOX_TR}\n"
+        return f"{_BOX_TL}{_BOX_H * h_len}{_BOX_TR}\n"
+
+    def _box_bottom(self):
+        return f"{_BOX_BL}{_BOX_H * (self.WIDTH - 2)}{_BOX_BR}\n"
+
+    def _content_width(self):
+        return self.WIDTH - 4
+
+    def _wrap_content(self, meta_lines, log_lines):
+        w = self._content_width()
+        div_len = self.WIDTH - 2
+        out = []
+        for line in meta_lines:
+            for folded in self._fold_line(line, w):
+                out.append(f"{_BOX_L} {folded} {_BOX_R}\n")
+        if meta_lines and log_lines:
+            out.append(f"{_BOX_DIV_L}{_BOX_H * div_len}{_BOX_DIV_R}\n")
+        for asctime, levelname, msg in log_lines:
+            full = f"{asctime} - {levelname} - {msg}"
+            for folded in self._fold_line(full, w):
+                out.append(f"{_BOX_L} {folded} {_BOX_R}\n")
+        return "".join(out)
+
+    def _render_block(self, title, meta_lines, log_lines):
+        out = self._box_top(title)
+        out += self._wrap_content(meta_lines, log_lines)
+        out += self._box_bottom()
+        return out
+
+    def _render_process_block_nested(self, meta_lines, log_lines, outer_w):
+        """Render process block nested inside GPU block. outer_w = parent content width."""
+        prefix = " "
+        inner_w = outer_w - 5 - len(prefix)  # content: prefix + │ + sp + folded + sp + │
+        h_len = inner_w + 2  # horizontal line spans (sp + content + sp) inside box
+        lines = []
+        lines.append(f"{prefix}{_BOX_TL}{_BOX_H * h_len}{_BOX_TR}")
+        for line in meta_lines:
+            for folded in self._fold_line(line, inner_w):
+                lines.append(f"{prefix}{_BOX_L} {folded} {_BOX_R}")
+        if meta_lines and log_lines:
+            lines.append(f"{prefix}{_BOX_DIV_L}{_BOX_H * h_len}{_BOX_DIV_R}")
+        for asctime, levelname, msg in log_lines:
+            full = f"{asctime} - {levelname} - {msg}"
+            for folded in self._fold_line(full, inner_w):
+                lines.append(f"{prefix}{_BOX_L} {folded} {_BOX_R}")
+        lines.append(f"{prefix}{_BOX_BL}{_BOX_H * h_len}{_BOX_BR}")
+        return lines
+
+    def _render_gpu_block_with_processes(self, gpu_id, gpu_meta, processes_data):
+        """Render GPU block with process blocks nested inside."""
+        w = self._content_width()
+        out = self._box_top(f"GPU {gpu_id}")
+        for line in gpu_meta:
+            for folded in self._fold_line(line, w):
+                out += f"{_BOX_L} {folded} {_BOX_R}\n"
+        for task, proc_data in sorted(processes_data.items(), key=lambda x: x[0]):
+            proc_meta = proc_data["meta"]
+            proc_logs = proc_data["logs"]
+            nested_lines = self._render_process_block_nested(proc_meta, proc_logs, w)
+            for ln in nested_lines:
+                out += f"{_BOX_L} {ln.ljust(w)} {_BOX_R}\n"
+        out += self._box_bottom()
+        return out
+
+    def render(self, scheduler_meta, gpu_meta_dict=None):
+        with self._lock:
+            out = self._render_block("Scheduler", scheduler_meta, self.scheduler_logs)
+            gpu_meta_dict = gpu_meta_dict or {}
+            all_gpu_ids = sorted(set(self.gpus.keys()) | set(gpu_meta_dict.keys()))
+            for gpu_id in all_gpu_ids:
+                gpu_data = self.gpus.get(gpu_id, {"processes": {}})
+                gpu_meta = gpu_meta_dict.get(gpu_id, [])
+                out += self._render_gpu_block_with_processes(
+                    gpu_id, gpu_meta, gpu_data["processes"]
+                )
+            return out
+
+    def clear_finished_processes(self):
+        with self._lock:
+            for gpu_id in list(self.gpus.keys()):
+                procs = self.gpus[gpu_id]["processes"]
+                finished = [t for t, d in procs.items() if d["finished"]]
+                for t in finished:
+                    del procs[t]
+                if not procs and not self.gpus[gpu_id]["meta"]:
+                    del self.gpus[gpu_id]
+
+    def check_and_roll(self, scheduler_meta=None, gpu_meta_dict=None):
+        """
+        At midnight, archive current content and clear finished process blocks.
+        Returns True if roll was performed.
+        """
+        today = datetime.date.today()
+        if today <= self._last_roll_date:
+            return False
+        self._last_roll_date = today
+        meta_s = scheduler_meta or []
+        meta_g = gpu_meta_dict or {}
+        content = self.render(meta_s, meta_g)
+        if content.strip():
+            archive_path = log_file_path.with_name(f"{log_file_path.name}.{today}")
+            try:
+                with archive_path.open("a", encoding="utf-8") as f:
+                    if archive_path.stat().st_size > 0:
+                        f.write("\n")
+                    f.write(content)
+            except Exception as e:
+                history_logger.debug(f"Failed to archive history: {e}")
+        self.clear_finished_processes()
+        return True
+
+
+class BufferedHistoryHandler(logging.Handler):
+    def __init__(self, buffer):
+        super().__init__()
+        self.buffer = buffer
+
+    def emit(self, record):
+        try:
+            gpu_id = getattr(record, "gpu_id", None)
+            task = getattr(record, "task", None)
+            if gpu_id is not None and task is not None:
+                self.buffer.append_process(gpu_id, task, record)
+            else:
+                self.buffer.append_scheduler(record)
+        except Exception:
+            self.handleError(record)
+
+
 def migrate_latest_history_log(log_file_path):
     """
-    On startup, move existing history.log content to the latest archived log,
-    so current history.log only contains the current scheduler run.
+    On startup, move existing history.log content to the latest archived log.
     """
     try:
         if (not log_file_path.exists()) or log_file_path.stat().st_size == 0:
@@ -116,22 +319,24 @@ def migrate_latest_history_log(log_file_path):
                     dst.write("\n")
             dst.write(old_content)
 
-        # Clear current log so it only keeps this run.
         with log_file_path.open("w", encoding="utf-8"):
             pass
     except Exception as e:
         print(f"Failed to migrate history.log on startup: {e}", file=sys.stderr)
 
+
+history_buffer = HistoryLogBuffer()
+migrate_latest_history_log(log_file_path)
+
 history_logger = logging.getLogger()
 history_logger.setLevel(logging.INFO)
-log_file_path = pathlib.Path("logs/history/history.log")
-log_file_path.parent.mkdir(parents=True, exist_ok=True)
-migrate_latest_history_log(log_file_path)
-file_handler = logging.handlers.TimedRotatingFileHandler(str(log_file_path), when="midnight", backupCount=7)
-file_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-history_logger.addHandler(file_handler)
+history_logger.handlers.clear()
+buffered_handler = BufferedHistoryHandler(history_buffer)
+buffered_handler.setLevel(logging.INFO)
+history_logger.addHandler(buffered_handler)
+
+# Keep file_handler ref for debug level changes in main()
+file_handler = None
 
 console_logger = logging.getLogger("console")
 console_logger.setLevel(logging.INFO)
@@ -145,6 +350,7 @@ console_logger.propagate = False
 # Global gpu status
 available_gpus = []
 gpus_lock = asyncio.Lock()
+exclude_gpus = set()  # GPUs to exclude (e.g. {0, 1}), applied when reading available_gpus.txt
 
 def parse_task(line):
     # Prefix markers in job files: ! running, # finished, ? terminated, no prefix waiting.
@@ -549,9 +755,15 @@ class ProcessorWorker:
                     bracket_pos = line_str.find('[')
                     if bracket_pos >= 0:
                         line_str = line_str[bracket_pos:]
-                    history_logger.info(f"[GPU {self.gpu_id}] {line_str}")
+                    history_logger.info(
+                        line_str,
+                        extra={"gpu_id": self.gpu_id, "task": task},
+                    )
         except Exception as e:
-            history_logger.debug(f"Error reading {stream_name} for task {task}: {e}")
+            history_logger.debug(
+                f"Error reading {stream_name}: {e}",
+                extra={"gpu_id": self.gpu_id, "task": task},
+            )
 
     async def generate_status_info(self):
         try:
@@ -647,9 +859,15 @@ class ProcessorWorker:
                                             
                                             self.status = "running"
                                             self.message_queue.put_nowait((task, "running"))
-                                            history_logger.info(f"GPU {self.gpu_id} started task: {task}")
+                                            history_logger.info(
+                                                f"started task: {task}",
+                                                extra={"gpu_id": self.gpu_id, "task": task},
+                                            )
                                         except (OSError, subprocess.SubprocessError) as e:
-                                            history_logger.error(f"Failed to start task on GPU {self.gpu_id}: {task}, error: {e}")
+                                            history_logger.error(
+                                                f"Failed to start task: {e}",
+                                                extra={"gpu_id": self.gpu_id, "task": task},
+                                            )
                                             self.message_queue.put_nowait((task, "waiting"))
                             except asyncio.QueueEmpty:
                                 pass
@@ -665,7 +883,11 @@ class ProcessorWorker:
                                     if proc_status == 0:
                                         self.retry_counts.pop(task, None)
                                         status = "finished"
-                                        history_logger.info(f"GPU {self.gpu_id} finished task: {task}")
+                                        history_buffer.mark_process_finished(self.gpu_id, task)
+                                        history_logger.info(
+                                            f"finished task: {task}",
+                                            extra={"gpu_id": self.gpu_id, "task": task},
+                                        )
                                     else:
                                         retry_count = self.retry_counts[task] + 1
                                         if retry_count <= self.max_retries:
@@ -677,15 +899,18 @@ class ProcessorWorker:
                                             self.task_queue.put_nowait(task)
                                             status = "waiting"
                                             history_logger.warning(
-                                                f"GPU {self.gpu_id} task failed with code {proc_status}, retry "
-                                                f"{retry_count}/{self.max_retries}: {task}"
+                                                f"task failed with code {proc_status}, retry "
+                                                f"{retry_count}/{self.max_retries}: {task}",
+                                                extra={"gpu_id": self.gpu_id, "task": task},
                                             )
                                         else:
                                             self.retry_counts.pop(task, None)
                                             status = "terminated"
+                                            history_buffer.mark_process_finished(self.gpu_id, task)
                                             history_logger.warning(
-                                                f"GPU {self.gpu_id} task failed with code {proc_status}, "
-                                                f"retries exhausted ({self.max_retries}): {task}"
+                                                f"task failed with code {proc_status}, "
+                                                f"retries exhausted ({self.max_retries}): {task}",
+                                                extra={"gpu_id": self.gpu_id, "task": task},
                                             )
                                     self.message_queue.put_nowait((task, status))
                                     self.task_start_times.pop(task, None)
@@ -700,23 +925,38 @@ class ProcessorWorker:
                                     self.message_queue.put_nowait((task, "waiting"))
                                     self.task_start_times.pop(task, None)
                                     proc.terminate()
-                                    history_logger.info(f"GPU {self.gpu_id} terminated task (GPU unavailable): {task}")
+                                    history_buffer.mark_process_finished(self.gpu_id, task)
+                                    history_logger.info(
+                                        f"terminated task (GPU unavailable): {task}",
+                                        extra={"gpu_id": self.gpu_id, "task": task},
+                                    )
                                 elif system_memory_pct >= 90.0:
                                     # Stop task if system memory exceeds 90%
                                     tasks_to_remove.append(task)
                                     self.message_queue.put_nowait((task, "waiting"))
                                     self.task_start_times.pop(task, None)
                                     proc.terminate()
-                                    history_logger.warning(f"GPU {self.gpu_id} terminated task (high system memory): {task}")
+                                    history_buffer.mark_process_finished(self.gpu_id, task)
+                                    history_logger.warning(
+                                        f"terminated task (high system memory): {task}",
+                                        extra={"gpu_id": self.gpu_id, "task": task},
+                                    )
                                 else:
                                     async with self.task_pool_lock:
                                         if task not in self.task_pool["running"] and task not in self.task_pool["waiting"]:
                                             tasks_to_remove.append(task)
                                             self.task_start_times.pop(task, None)
                                             proc.terminate()
-                                            history_logger.info(f"GPU {self.gpu_id} terminated task (removed from pool): {task}")
+                                            history_buffer.mark_process_finished(self.gpu_id, task)
+                                            history_logger.info(
+                                                f"terminated task (removed from pool): {task}",
+                                                extra={"gpu_id": self.gpu_id, "task": task},
+                                            )
                             except Exception as e:
-                                history_logger.error(f"Error checking task status on GPU {self.gpu_id}: {task}, error: {e}")
+                                history_logger.error(
+                                    f"Error checking task status: {e}",
+                                    extra={"gpu_id": self.gpu_id, "task": task},
+                                )
                             
                         for task in tasks_to_remove:
                             self.running_proc.pop(task, None)
@@ -747,9 +987,16 @@ class ProcessorWorker:
                 for task, proc in self.running_proc.items():
                     try:
                         proc.terminate()
-                        history_logger.info(f"GPU {self.gpu_id} terminated task during shutdown: {task}")
+                        history_buffer.mark_process_finished(self.gpu_id, task)
+                        history_logger.info(
+                            f"terminated task during shutdown: {task}",
+                            extra={"gpu_id": self.gpu_id, "task": task},
+                        )
                     except Exception as e:
-                        history_logger.error(f"Error terminating process for task {task}: {e}")
+                        history_logger.error(
+                            f"Error terminating process: {e}",
+                            extra={"gpu_id": self.gpu_id, "task": task},
+                        )
                 
                 # Cancel all log reader tasks
                 for task, (stdout_task, stderr_task) in self.log_readers.items():
@@ -776,7 +1023,8 @@ async def monitor_gpus():
                             with gpu_file.open("r") as f:
                                 file_gpus = f.read().split()
                                 if all(gpu.isdigit() for gpu in file_gpus):
-                                    available_gpus = [int(gpu) for gpu in file_gpus]
+                                    raw = [int(gpu) for gpu in file_gpus]
+                                    available_gpus = [g for g in raw if g not in exclude_gpus]
                     except (OSError, IOError) as e:
                         history_logger.warning(f"Failed to read GPU file: {e}")
             except asyncio.CancelledError:
@@ -869,6 +1117,88 @@ async def console_printer(gpu_workers, task_io):
     finally:
         history_logger.debug("console_printer task stopped")
 
+
+HISTORY_FLUSH_INTERVAL = 2.0
+
+
+async def _gather_scheduler_meta(task_io):
+    lines = []
+    system_memory_pct = get_system_memory_usage()
+    lines.append(f"System Memory: {system_memory_pct:.2f}%")
+    async with task_io.file_io_lock:
+        job_stats = sorted(task_io.file_task_stats.items(), key=lambda x: str(x[0]))
+    if not job_stats:
+        lines.append("No active job files")
+    else:
+        for file_path, stats in job_stats:
+            rel = str(file_path.relative_to(task_io.jobs_dir))
+            lines.append(
+                f"{rel} | waiting: {stats['waiting']:5d} | "
+                f"running: {stats['running']:5d} | finished: {stats['finished']:5d}"
+            )
+        total = {"waiting": 0, "running": 0, "finished": 0}
+        for _, s in job_stats:
+            total["waiting"] += s["waiting"]
+            total["running"] += s["running"]
+            total["finished"] += s["finished"]
+        lines.append(
+            f"TOTAL | waiting: {total['waiting']:5d} | "
+            f"running: {total['running']:5d} | finished: {total['finished']:5d}"
+        )
+    return lines
+
+
+async def _gather_gpu_meta(gpu_workers):
+    result = {}
+    for w in gpu_workers:
+        try:
+            info = await w.generate_status_info()
+            if info is not None:
+                result[w.gpu_id] = [ln.strip() for ln in info.strip().split("\n") if ln.strip()]
+        except Exception:
+            result[w.gpu_id] = [f"GPU {w.gpu_id} - Status: {w.status}"]
+    return result
+
+
+async def history_flush_loop(task_io, gpu_workers):
+    _last_content = None
+    try:
+        while True:
+            await asyncio.sleep(HISTORY_FLUSH_INTERVAL)
+            try:
+                scheduler_meta = await _gather_scheduler_meta(task_io)
+                gpu_meta = await _gather_gpu_meta(gpu_workers)
+
+                history_buffer.check_and_roll(scheduler_meta, gpu_meta)
+
+                for w in gpu_workers:
+                    async with w.status_lock:
+                        for task in w.running_proc:
+                            elapsed = time.time() - w.task_start_times.get(task, time.time())
+                            timestr = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+                            meta = [f"Command: {task}", f"Runtime: {timestr}"]
+                            history_buffer.update_process_meta(w.gpu_id, task, meta)
+
+                content = history_buffer.render(scheduler_meta, gpu_meta)
+                if content != _last_content:
+                    with log_file_path.open("w", encoding="utf-8") as f:
+                        f.write(content)
+                    _last_content = content
+            except Exception as e:
+                history_logger.debug(f"Error in history flush: {e}")
+    except asyncio.CancelledError:
+        history_logger.debug("history_flush_loop cancelled")
+    finally:
+        try:
+            scheduler_meta = await _gather_scheduler_meta(task_io)
+            gpu_meta = await _gather_gpu_meta(gpu_workers) if gpu_workers else {}
+            content = history_buffer.render(scheduler_meta, gpu_meta)
+            with log_file_path.open("w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            history_logger.debug(f"Final history flush error: {e}")
+
+
 async def main():
     parser = argparse.ArgumentParser(description='Async GPU task scheduler')
     parser.add_argument('--max-memory', type=float, default=80.0,
@@ -881,11 +1211,16 @@ async def main():
                         help='Maximum retries for non-zero exit tasks (default: 3)')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Debug mode')
+    parser.add_argument('--exclude-gpus', type=str, default=None,
+                        help='Comma-separated GPU IDs to exclude (e.g. 0,1)')
     args = parser.parse_args()
+
+    if args.exclude_gpus:
+        exclude_gpus.update(int(x.strip()) for x in args.exclude_gpus.split(",") if x.strip())
     
     if args.debug:
         console_logger.setLevel(logging.DEBUG)
-        file_handler.setLevel(logging.DEBUG)
+        buffered_handler.setLevel(logging.DEBUG)
         history_logger.setLevel(logging.DEBUG)
     
     history_logger.info("Starting async GPU task scheduler")
@@ -896,7 +1231,8 @@ async def main():
     gpu_workers = None
     gpu_worker_loops = None
     console_printer_loop = None
-    
+    history_flush_loop_task = None
+
     try:
         monitor_gpu_loop = asyncio.create_task(monitor_gpus())
         task_io = TaskIO()
@@ -915,6 +1251,7 @@ async def main():
         ]
         gpu_worker_loops = [asyncio.create_task(gpu_worker.start(task_io.task_queue, task_io.message_queue, task_io.task_pool, task_io.task_pool_lock)) for gpu_worker in gpu_workers]
         console_printer_loop = asyncio.create_task(console_printer(gpu_workers, task_io))
+        history_flush_loop_task = asyncio.create_task(history_flush_loop(task_io, gpu_workers))
         
         history_logger.info("All tasks started successfully")
         await asyncio.sleep(float('inf'))
@@ -934,6 +1271,10 @@ async def main():
             history_logger.debug("Cancelling console printer")
             console_printer_loop.cancel()
             tasks_to_gather.append(console_printer_loop)
+        if history_flush_loop_task is not None:
+            history_logger.debug("Cancelling history flush loop")
+            history_flush_loop_task.cancel()
+            tasks_to_gather.append(history_flush_loop_task)
         if monitor_gpu_loop is not None:
             history_logger.debug("Cancelling GPU monitor")
             monitor_gpu_loop.cancel()
